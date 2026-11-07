@@ -1,0 +1,158 @@
+import os
+from pathlib import Path
+
+from agents.agent_responses import AnalysisInsights
+from static_analyzer.config import NodeType
+from infra.utils import sanitize
+
+
+def generated_mermaid_str(
+    analysis: AnalysisInsights, expanded_components: set[str], repo_ref: str, project: str, demo=False
+) -> str:
+    lines = ["```mermaid", "graph LR"]
+
+    # 1. Define each component as a node, including its description
+    for comp in analysis.components:
+        node_key = sanitize(comp.name)
+        # Show name and short description in the node label
+        label = f"{comp.name}"
+        lines.append(f'    {node_key}["{label}"]')
+
+    # 2. Add relations as labeled edges
+    for rel in analysis.components_relations:
+        src_key = sanitize(rel.src_name)
+        dst_key = sanitize(rel.dst_name)
+        # Use the relation phrase as the edge label
+        lines.append(f'    {src_key} -- "{rel.relation}" --> {dst_key}')
+    # Linking to other files.
+    for comp in analysis.components:
+        node_key = sanitize(comp.name)
+        if comp.component_id in expanded_components:
+            # Create a link to the component's details file
+            if not demo:
+                docs_ref = repo_ref.rstrip("/") if repo_ref else "."
+                lines.append(f'    click {node_key} href "{docs_ref}/{node_key}.md" "Details"')
+            else:
+                # For demo, link to a static URL
+                lines.append(
+                    f'    click {node_key} href "https://github.com/CodeBoarding/GeneratedOnBoardings/blob/main/{project}/{node_key}.md" "Details"'
+                )
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def generate_markdown(
+    insights: AnalysisInsights,
+    project: str = "",
+    repo_ref="",
+    expanded_components: set[str] | None = None,
+    demo=False,
+    repo_path: Path = Path(),
+) -> str:
+    """
+    Generate a Mermaid 'graph LR' diagram from an AnalysisInsights object.
+    """
+    expanded_components = expanded_components or set()
+
+    mermaid_str = generated_mermaid_str(
+        insights, repo_ref=repo_ref, expanded_components=expanded_components, project=project, demo=demo
+    )
+
+    lines = [
+        mermaid_str,
+        "\n[![CodeBoarding](https://img.shields.io/badge/Generated%20by-CodeBoarding-9cf?style=flat-square)](https://github.com/CodeBoarding/CodeBoarding)[![Web platform](https://img.shields.io/badge/Open%20in-Web%20platform-2563EB?style=flat-square)](https://app.codeboarding.org)[![Demo](https://img.shields.io/badge/Try%20our-Demo-blue?style=flat-square)](https://www.codeboarding.org/diagrams)[![Contact](https://img.shields.io/badge/Contact%20us%20-%20contact@codeboarding.org-lightgrey?style=flat-square)](mailto:contact@codeboarding.org)",
+    ]
+
+    detail_lines = ["\n## Details\n", f"{insights.description}\n"]
+
+    root_dir = str(repo_path / project)
+
+    for comp in insights.components:
+        detail_lines.append(component_header(comp.name, comp.component_id, expanded_components))
+        detail_lines.append(f"{comp.description}")
+        if comp.key_entities:
+            qn_list = []
+            for reference in comp.key_entities:
+                if not reference.reference_file:
+                    continue
+                if not repo_ref or not os.path.exists(Path(root_dir) / reference.reference_file):
+                    qn_list.append(f"{reference}")
+                    continue
+                ref_url = repo_ref + reference.reference_file
+                if (
+                    reference.reference_start_line is not None
+                    and reference.reference_end_line is not None
+                    and (
+                        not (
+                            reference.reference_start_line <= reference.reference_end_line <= 0
+                            or reference.reference_start_line == reference.reference_end_line
+                        )
+                    )
+                ):
+                    ref_url += f"#L{reference.reference_start_line}-L{reference.reference_end_line}"
+                qn_list.append(f'<a href="{ref_url}" target="_blank" rel="noopener noreferrer">{reference}</a>')
+            # Join the list into an unordered markdown list, without the leading dash
+            references = ""
+            for item in qn_list:
+                references += f"- {item}\n"
+
+            detail_lines.append(f"\n\n**Related Classes/Methods**:\n\n{references}")
+        else:
+            detail_lines.append(f"\n\n**Related Classes/Methods**: _None_")
+        if comp.file_methods:
+            fm_lines = "\n\n**Source Files:**\n\n"
+            for fg in comp.file_methods:
+                if repo_ref:
+                    fm_lines += f"- [`{fg.file_path}`]({repo_ref}{fg.file_path})\n"
+                else:
+                    fm_lines += f"- `{fg.file_path}`\n"
+                for method in fg.methods:
+                    label = NodeType.from_name(method.node_type).label()
+                    line_ref = f"L{method.start_line}-L{method.end_line}"
+                    if repo_ref:
+                        line_link = f"[{line_ref}]({repo_ref}{fg.file_path}#{line_ref})"
+                    else:
+                        line_link = line_ref
+                    fm_lines += f"  - `{method.qualified_name}` ({line_link}) - {label}\n"
+            detail_lines.append(fm_lines)
+        detail_lines.append("")  # blank line between components
+
+    detail_lines.append(
+        "\n\n### [FAQ](https://github.com/CodeBoarding/GeneratedOnBoardings/tree/main?tab=readme-ov-file#faq)"
+    )
+    return "\n".join(lines + detail_lines)
+
+
+def generate_markdown_file(
+    file_name: str,
+    insights: AnalysisInsights,
+    project: str,
+    repo_ref: str,
+    expanded_components: set[str],
+    temp_dir: Path,
+    demo: bool = False,
+    repo_path: Path = Path(),
+) -> Path:
+    content = generate_markdown(
+        insights,
+        project=project,
+        repo_ref=repo_ref,
+        expanded_components=expanded_components,
+        demo=demo,
+        repo_path=repo_path,
+    )
+    markdown_file = temp_dir / f"{file_name}.md"
+    with open(markdown_file, "w", encoding="utf-8") as f:
+        f.write(content)
+    return markdown_file
+
+
+def component_header(component_name: str, component_id: str, expanded_components: set[str]) -> str:
+    """
+    Generate a header for a component with its name and a link to its details.
+    """
+    sanitized_name = sanitize(component_name)
+    if component_id in expanded_components:
+        return f"### {component_name} [[Expand]](./{sanitized_name}.md)"
+    else:
+        return f"### {component_name}"

@@ -1,0 +1,37 @@
+from dataclasses import dataclass
+from pathlib import Path
+
+from infra.monitoring.paths import generate_log_path
+from infra.utils import generate_run_id
+
+# Safety-valve depth cap, not a target — see --depth-cap help / README for why.
+# A component that outgrows the leaf ceiling is flagged expandable at whatever depth
+# the run stops, so this cap bounds how much gets expanded up front, not whether a
+# large component *can* be expanded (on demand, via the partial-analysis API). Raise
+# it to auto-expand deeper.
+DEFAULT_DEPTH_CAP = 3
+
+
+@dataclass(frozen=True, slots=True)
+class RunPaths:
+    """The repo/output locations + project name a single analysis run operates on."""
+
+    repo_path: Path
+    output_dir: Path
+    project_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class RunContext:
+    """Identifiers for a single analysis execution."""
+
+    run_id: str
+    log_path: str
+
+    @classmethod
+    def resolve(cls, project_name: str) -> "RunContext":
+        """Resolve the run metadata needed to construct a DiagramGenerator."""
+        return cls(
+            run_id=generate_run_id(),
+            log_path=generate_log_path(project_name),
+        )

@@ -1,0 +1,329 @@
+"""TypeScript / JavaScript project discovery.
+
+Resolves each project's owned file list via ``tsc --showConfig`` so that nested
+``tsconfig.json`` files in a monorepo don't double-claim files. Why: a "solution"
+tsconfig at the repo root (``files: []`` + ``references: [...]``) must contribute
+zero files itself, or every overlapping file gets analyzed twice and inflates
+reference / package counts.
+"""
+
+import json
+import logging
+import os
+import shutil
+import subprocess
+
+import pathspec
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from infra.repo_utils.ignore import RepoIgnoreManager
+from static_analyzer.config import LANGUAGE_EXTENSIONS, Language
+from infra.tool_registry.paths import get_servers_dir, preferred_node_path
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TypeScriptProject:
+    """One TS/JS project the engine should analyze.
+
+    ``files`` are absolute paths the engine should send to the LSP — anything
+    broader would re-claim files belonging to a sibling project.
+    """
+
+    root: Path
+    files: list[Path] = field(default_factory=list)
+    # ``exclude`` as the tsconfig gave it. A file under here was actively skipped,
+    # so the family top-up must leave it alone rather than re-claiming it.
+    exclude: list[str] = field(default_factory=list)
+
+
+_ALL_EXTENSIONS = LANGUAGE_EXTENSIONS[Language.TYPESCRIPT]
+
+
+def _exclude_spec(patterns: list[str]) -> pathspec.PathSpec:
+    """tsconfig ``exclude`` entries as a matcher over project-relative posix paths.
+
+    Why anchored: tsconfig resolves ``exclude`` against its own directory, gitwildmatch does not.
+    """
+    cleaned = [p.strip().replace("\\", "/").rstrip("/") for p in patterns if isinstance(p, str) and p.strip()]
+    return pathspec.PathSpec.from_lines("gitwildmatch", [f"/{p}" for p in cleaned])
+
+
+class TypeScriptConfigScanner:
+    """Discovers TS/JS project roots and their owned files for monorepo support."""
+
+    CONFIG_FILES = ["tsconfig.json", "jsconfig.json"]
+
+    def __init__(self, repo_location: Path, ignore_manager: RepoIgnoreManager | None = None):
+        self.repo_location = repo_location.resolve()
+        self.ignore_manager = ignore_manager or RepoIgnoreManager(repo_location)
+
+    def find_typescript_projects(self) -> list[TypeScriptProject]:
+        """Return one project per leaf tsconfig with its authoritative file list.
+
+        Strategy: discover candidate tsconfigs, resolve each one's file set via
+        ``tsc --showConfig`` (or a disjoint FS walk if tsc is unavailable), then
+        ``_trim_overlap`` so each file ends up in exactly one project — the
+        deepest that claims it. A project whose entire claim is covered by
+        deeper ones (a pure "solution" tsconfig) is dropped.
+        """
+        candidate_dirs = self._discover_candidates()
+        if not candidate_dirs:
+            logger.warning(f"No TypeScript configuration files found in {self.repo_location}")
+            return []
+
+        tsc_cmd_prefix = _resolve_tsc_command()
+        if tsc_cmd_prefix is None:
+            logger.warning(
+                "tsc not available (neither bundled tsc.js under servers/ nor system tsc on PATH); "
+                "falling back to disjoint filesystem walks. File-membership precision will be "
+                "lower than tsc --showConfig but each file is still claimed by exactly one project."
+            )
+
+        projects: list[TypeScriptProject] = []
+        # A directory, or a config file one of them references (``tsconfig.app.json``).
+        pending: list[Path] = list(candidate_dirs)
+        seen = {_config_key(path) for path in pending}
+        while pending:
+            config = pending.pop(0)
+            files, excluded, references = self._resolve_project_files(config, tsc_cmd_prefix, candidate_dirs)
+            for reference in references:
+                key = _config_key(reference)
+                if key not in seen:
+                    seen.add(key)
+                    pending.append(reference)
+            if not files:
+                logger.debug(f"Skipping tsconfig at {config} (no owned files)")
+                continue
+            projects.append(TypeScriptProject(root=_project_dir(config), files=files, exclude=excluded))
+
+        projects = self._trim_overlap(projects)
+
+        if projects:
+            total_files = sum(len(p.files) for p in projects)
+            logger.info(
+                f"Found {len(projects)} TypeScript project(s) in repository "
+                f"({total_files} total files across all projects)"
+            )
+        return projects
+
+    def find_unclaimed_family_files(self, projects: list[TypeScriptProject]) -> list[Path]:
+        """Family files no tsconfig ``include`` reaches. What one excludes stays excluded."""
+        claimed = {f.resolve() for project in projects for f in project.files}
+        specs = [(p.root.resolve(), _exclude_spec(p.exclude)) for p in projects]
+        found: set[Path] = set()
+        for path in _files_under(self.repo_location):
+            if not path.is_file() or path.suffix not in _ALL_EXTENSIONS:
+                continue
+            resolved = path.resolve()
+            if resolved in claimed or self.ignore_manager.should_ignore(path):
+                continue
+            if any(_excluded_by(resolved, root, spec) for root, spec in specs):
+                continue
+            found.add(resolved)
+        return sorted(found)
+
+    def _discover_candidates(self) -> list[Path]:
+        seen: set[Path] = set()
+        candidates: list[Path] = []
+        configs = [path for path in _files_under(self.repo_location) if path.name in self.CONFIG_FILES]
+        for config_file in self.CONFIG_FILES:
+            for config_path in (path for path in configs if path.name == config_file):
+                if not config_path.is_file():
+                    continue
+                if self.ignore_manager.should_ignore(config_path):
+                    logger.debug(f"Skipping ignored config file: {config_path}")
+                    continue
+                project_dir = config_path.parent.resolve()
+                if project_dir in seen:
+                    continue
+                seen.add(project_dir)
+                candidates.append(project_dir)
+        return candidates
+
+    def _resolve_project_files(
+        self,
+        config: Path,
+        tsc_cmd_prefix: list[str] | None,
+        all_candidates: list[Path],
+    ) -> tuple[list[Path], list[str], list[Path]]:
+        """The files *config* owns, what it excludes, and the configs its ``references`` name.
+
+        *config* is a project directory or a config file. Why references: a solution config
+        (``files: []`` plus ``references``, as Vite scaffolds ``webview-ui/``) owns nothing itself;
+        its files sit in the configs it references, which carry names discovery never looks for.
+        """
+        project_dir = _project_dir(config)
+        if tsc_cmd_prefix is not None:
+            shown = self._showconfig(config, tsc_cmd_prefix)
+            if shown is not None:
+                excluded = [e for e in shown.get("exclude", []) if isinstance(e, str)]
+                files = []
+                for raw in shown.get("files", []):
+                    if not isinstance(raw, str):
+                        continue
+                    p = Path(raw)
+                    if not p.is_absolute():
+                        p = project_dir / p
+                    files.append(p.resolve())
+                # Apply ignore_manager: a permissive root tsconfig can claim
+                # files (e.g. ``*.test.ts``) the user has skipped via
+                # .codeboardingignore — keep that consistent with the FS fallback.
+                kept = [f for f in files if f.suffix in _ALL_EXTENSIONS and not self.ignore_manager.should_ignore(f)]
+                return kept, excluded, self._references(shown, project_dir)
+            # tsc available but failed for this project — try the FS walk.
+        return self._fallback_walk(project_dir, all_candidates), [], []
+
+    def _references(self, shown: dict, project_dir: Path) -> list[Path]:
+        """The configs a shown config references that exist inside the repository and are not ignored."""
+        found: list[Path] = []
+        for reference in shown.get("references", []):
+            raw = reference.get("path") if isinstance(reference, dict) else None
+            if not isinstance(raw, str):
+                continue
+            target = (project_dir / raw).resolve()
+            config_file = target / "tsconfig.json" if target.is_dir() else target
+            if not config_file.is_file() or not config_file.is_relative_to(self.repo_location):
+                continue
+            if self.ignore_manager.should_ignore(config_file):
+                continue
+            found.append(target)
+        return found
+
+    def _showconfig(self, config: Path, tsc_cmd_prefix: list[str]) -> dict | None:
+        """Invoke ``tsc --showConfig -p <config> --allowJs`` and return parsed JSON.
+
+        Why ``--allowJs``: one adapter owns the family, so we want the project's JavaScript too.
+        It overrides only that setting, leaving tsc the authority on membership.
+        """
+        cmd = [*tsc_cmd_prefix, "-p", str(config), "--allowJs"]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logger.debug(f"tsc --showConfig invocation failed for {config}: {e}")
+            return None
+
+        if result.returncode != 0:
+            logger.debug(f"tsc --showConfig exited {result.returncode} for {config}: " f"{result.stderr.strip()[:200]}")
+            return None
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            logger.debug(f"tsc --showConfig JSON parse failed for {config}: {e}")
+            return None
+
+    def _fallback_walk(self, project_dir: Path, all_candidates: list[Path]) -> list[Path]:
+        """Disjoint filesystem walk used when ``tsc --showConfig`` is unavailable.
+
+        Walks ``project_dir`` skipping any subtree owned by another candidate so
+        each TS/JS file is claimed exactly once. Less precise than tsc (no
+        ``include``/``exclude`` honour) but avoids the double-counting bug.
+        """
+        nested = [c for c in all_candidates if c != project_dir and _is_ancestor(project_dir, c)]
+        files: list[Path] = []
+        for path in _files_under(project_dir):
+            if not path.is_file():
+                continue
+            if path.suffix not in _ALL_EXTENSIONS:
+                continue
+            if self.ignore_manager.should_ignore(path):
+                continue
+            if any(_is_ancestor(n, path) for n in nested):
+                continue
+            files.append(path.resolve())
+        files.sort()
+        return files
+
+    @staticmethod
+    def _trim_overlap(projects: list[TypeScriptProject]) -> list[TypeScriptProject]:
+        """Assign each file to the deepest project that claims it.
+
+        Why deepest-first: leaf tsconfigs typically have stricter ``exclude``
+        patterns and represent the package author's view of "production code,"
+        so attributing shared files to the leaf preserves that intent. A parent
+        with files no leaf covers keeps its leftover; a parent whose entire set
+        is covered by leaves (pure solution tsconfig) is dropped. Alphabetical
+        path tiebreak on equal depth keeps siblings deterministic across runs.
+        """
+        indexed = list(enumerate(projects))
+        indexed.sort(key=lambda ip: (-len(ip[1].root.parts), str(ip[1].root)))
+
+        claimed: set[Path] = set()
+        survivors: list[tuple[int, TypeScriptProject]] = []
+        for orig_idx, project in indexed:
+            unique = [f for f in project.files if f not in claimed]
+            if not unique:
+                logger.debug(f"Dropping project {project.root} — all files claimed by deeper projects")
+                continue
+            if len(unique) < len(project.files):
+                logger.debug(f"Trimmed project {project.root} from {len(project.files)} to {len(unique)} files")
+            claimed.update(unique)
+            survivors.append((orig_idx, TypeScriptProject(root=project.root, files=unique, exclude=project.exclude)))
+
+        survivors.sort(key=lambda ip: ip[0])
+        return [p for _, p in survivors]
+
+
+def _project_dir(config: Path) -> Path:
+    """The directory a config resolves paths against: itself for a directory, else its parent."""
+    return config if config.is_dir() else config.parent
+
+
+def _config_key(config: Path) -> Path:
+    """One key per config, so a directory and the ``tsconfig.json`` inside it count once."""
+    return config.resolve() if config.is_dir() or config.name != "tsconfig.json" else config.parent.resolve()
+
+
+def _is_ancestor(maybe_ancestor: Path, descendant: Path) -> bool:
+    try:
+        descendant.relative_to(maybe_ancestor)
+    except ValueError:
+        return False
+    return descendant != maybe_ancestor
+
+
+def _resolve_system_tsc() -> str | None:
+    """Find ``tsc`` on PATH via ``shutil.which`` so Windows ``PATHEXT`` is honoured
+    (``tsc.cmd``/``tsc.exe``/``tsc.bat`` from various installers all resolve)."""
+    return shutil.which("tsc")
+
+
+def _resolve_tsc_command() -> list[str] | None:
+    """Return the prefix for invoking ``tsc --showConfig`` on this host.
+
+    Prefers the embedded ``node`` + bundled ``tsc.js`` (vendored alongside
+    typescript-language-server, no PATH assumptions); falls back to ``tsc`` on
+    PATH; returns ``None`` if neither is available. The caller appends ``-p <dir>``.
+    """
+    node_path = preferred_node_path(get_servers_dir())
+    bundled_tsc = get_servers_dir() / "node_modules" / "typescript" / "lib" / "tsc.js"
+    if node_path and bundled_tsc.exists():
+        return [node_path, str(bundled_tsc), "--showConfig"]
+    system_tsc = _resolve_system_tsc()
+    if system_tsc is not None:
+        return [system_tsc, "--showConfig"]
+    return None
+
+
+def _excluded_by(path: Path, project_root: Path, spec: pathspec.PathSpec) -> bool:
+    """Whether *path* falls under one of *project_root*'s tsconfig exclude patterns."""
+    try:
+        return spec.match_file(path.relative_to(project_root).as_posix())
+    except ValueError:
+        return False
+
+
+def _files_under(root: Path) -> Iterator[Path]:
+    """Every file under *root*, never walking ``node_modules`` or dot folders (ignored anyway, and huge once installed)."""
+    for directory, folders, files in os.walk(root):
+        folders[:] = [name for name in folders if name != "node_modules" and not name.startswith(".")]
+        yield from (Path(directory, name) for name in files)

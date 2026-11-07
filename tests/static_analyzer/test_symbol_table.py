@@ -1,0 +1,555 @@
+"""Tests for static_analyzer.engine.symbol_table.SymbolTable."""
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from static_analyzer.engine.language_adapter import LanguageAdapter
+from static_analyzer.config import NodeType
+from static_analyzer.engine.models import SymbolInfo
+from static_analyzer.engine.symbol_table import SymbolTable
+
+
+def _make_adapter() -> MagicMock:
+    """Create a mock adapter with realistic is_callable / is_class_like."""
+    adapter = MagicMock(spec=LanguageAdapter)
+    adapter.is_callable.side_effect = lambda k: k in (NodeType.FUNCTION, NodeType.METHOD, NodeType.CONSTRUCTOR)
+    adapter.is_class_like.side_effect = lambda k: k == NodeType.CLASS
+    adapter.build_qualified_name.side_effect = lambda fp, name, kind, chain, root, detail="": (
+        ".".join(n for n, _ in chain) + "." + name if chain else f"{fp.stem}.{name}"
+    )
+    adapter.build_reference_key.side_effect = lambda qn: qn
+    adapter.should_track_for_edges.side_effect = lambda k: k in (
+        NodeType.FUNCTION,
+        NodeType.METHOD,
+        NodeType.CONSTRUCTOR,
+        NodeType.CLASS,
+        NodeType.VARIABLE,
+        NodeType.CONSTANT,
+    )
+    return adapter
+
+
+def _sym(
+    name: str,
+    qname: str,
+    kind: int,
+    fpath: str = "mod.py",
+    start_line: int = 0,
+    start_char: int = 0,
+    end_line: int = 10,
+    end_char: int = 0,
+    parent_chain: list[tuple[str, int]] | None = None,
+) -> SymbolInfo:
+    info = SymbolInfo(
+        name=name,
+        qualified_name=qname,
+        kind=kind,
+        file_path=Path(fpath),
+        start_line=start_line,
+        start_char=start_char,
+        end_line=end_line,
+        end_char=end_char,
+    )
+    info.parent_chain = parent_chain or []
+    return info
+
+
+def _class_with_child(child_name: str, child_kind: int) -> list[dict]:
+    """A ``MyClass`` declaring one member, in the document-symbol shape the LSP returns."""
+    span = {"start": {"line": 0, "character": 0}, "end": {"line": 20, "character": 0}}
+    return [
+        {
+            "name": "MyClass",
+            "kind": NodeType.CLASS,
+            "range": span,
+            "children": [{"name": child_name, "kind": child_kind, "range": span}],
+        }
+    ]
+
+
+# ---- register_symbols ----
+
+
+class TestRegisterSymbols:
+    def test_registers_simple_function(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        symbols = [
+            {
+                "name": "foo",
+                "kind": NodeType.FUNCTION,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 0}},
+                "selectionRange": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 7}},
+            }
+        ]
+        st.register_symbols(Path("mod.py"), symbols, parent_chain=[], project_root=Path("/root"))
+        assert "mod.foo" in st.symbols
+        assert st.symbols["mod.foo"].kind == NodeType.FUNCTION
+
+    def test_registers_nested_children(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        symbols = [
+            {
+                "name": "MyClass",
+                "kind": NodeType.CLASS,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 20, "character": 0}},
+                "selectionRange": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 13}},
+                "children": [
+                    {
+                        "name": "method",
+                        "kind": NodeType.METHOD,
+                        "range": {"start": {"line": 2, "character": 4}, "end": {"line": 10, "character": 0}},
+                        "selectionRange": {"start": {"line": 2, "character": 8}, "end": {"line": 2, "character": 14}},
+                    }
+                ],
+            }
+        ]
+        st.register_symbols(Path("mod.py"), symbols, parent_chain=[], project_root=Path("/root"))
+        assert "mod.MyClass" in st.symbols
+        # The child should be registered with parent chain
+        assert "MyClass.method" in st.symbols
+
+    @pytest.mark.parametrize("fields_are_members,expected", [(True, NodeType.ENUM_MEMBER), (False, NodeType.FIELD)])
+    def test_enum_fields_become_members_only_where_the_server_files_them_so(self, fields_are_members, expected):
+        adapter = _make_adapter()
+        adapter.reports_enum_members_as_fields = fields_are_members
+        st = SymbolTable(adapter)
+        symbols = [
+            {
+                "name": "Color",
+                "kind": NodeType.ENUM,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 3, "character": 0}},
+                "selectionRange": {"start": {"line": 0, "character": 5}, "end": {"line": 0, "character": 10}},
+                "children": [
+                    {
+                        "name": "Red",
+                        "kind": NodeType.FIELD,
+                        "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}},
+                        "selectionRange": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}},
+                    }
+                ],
+            }
+        ]
+        st.register_symbols(Path("mod.cs"), symbols, parent_chain=[], project_root=Path("/root"))
+        assert st.symbols["Color.Red"].kind == expected
+
+    def test_promotes_variable_with_callable_children_to_class(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        symbols = [
+            {
+                "name": "handler",
+                "kind": NodeType.VARIABLE,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 0}},
+                "selectionRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 7}},
+                "children": [
+                    {
+                        "name": "process",
+                        "kind": NodeType.METHOD,
+                        "range": {"start": {"line": 2, "character": 4}, "end": {"line": 5, "character": 0}},
+                        "selectionRange": {"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 11}},
+                    }
+                ],
+            }
+        ]
+        st.register_symbols(Path("mod.py"), symbols, parent_chain=[], project_root=Path("/root"))
+        assert st.symbols["mod.handler"].kind == NodeType.CLASS
+
+    def test_dual_registration_creates_alias(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        symbols = [
+            {
+                "name": "MyClass",
+                "kind": NodeType.CLASS,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 20, "character": 0}},
+                "selectionRange": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 13}},
+                "children": [
+                    {
+                        "name": "inner_func",
+                        "kind": NodeType.FUNCTION,
+                        "range": {"start": {"line": 5, "character": 4}, "end": {"line": 10, "character": 0}},
+                        "selectionRange": {"start": {"line": 5, "character": 8}, "end": {"line": 5, "character": 18}},
+                    }
+                ],
+            }
+        ]
+        st.register_symbols(Path("mod.py"), symbols, parent_chain=[], project_root=Path("/root"))
+        # Primary registration
+        assert "MyClass.inner_func" in st.symbols
+        # Dual registration (unqualified alias)
+        assert "mod.inner_func" in st.symbols
+        # Alias should NOT be in primary_file_symbols
+        primary_qnames = {s.qualified_name for s in st.primary_file_symbols.get("mod.py", [])}
+        assert "mod.inner_func" not in primary_qnames
+        # But should be in file_symbols
+        all_qnames = {s.qualified_name for s in st.file_symbols.get("mod.py", [])}
+        assert "mod.inner_func" in all_qnames
+
+    def test_a_class_member_bound_to_a_function_is_a_method(self):
+        st = SymbolTable(_make_adapter())
+        st.register_symbols(
+            Path("mod.ts"),
+            _class_with_child("on_move", NodeType.PROPERTY),
+            parent_chain=[],
+            project_root=Path("/root"),
+            function_values={(0, 0)},
+        )
+        assert st.symbols["MyClass.on_move"].kind == NodeType.METHOD
+
+    def test_a_class_member_holding_a_value_keeps_its_kind(self):
+        st = SymbolTable(_make_adapter())
+        st.register_symbols(
+            Path("mod.ts"), _class_with_child("limit", NodeType.PROPERTY), parent_chain=[], project_root=Path("/root")
+        )
+        assert st.symbols["MyClass.limit"].kind == NodeType.PROPERTY
+
+    def test_a_module_variable_bound_to_a_function_keeps_its_kind(self):
+        st = SymbolTable(_make_adapter())
+        span = {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 20}}
+        symbols = [{"name": "handler", "kind": NodeType.VARIABLE, "range": span}]
+        st.register_symbols(
+            Path("mod.ts"), symbols, parent_chain=[], project_root=Path("/root"), function_values={(0, 0)}
+        )
+        assert st.symbols["mod.handler"].kind == NodeType.VARIABLE
+
+    def test_an_alias_keeps_the_first_declaration_registered_under_its_name(self):
+        st = SymbolTable(_make_adapter())
+        st.register_symbols(
+            Path("model.rs"), [self._class("Model", [1, 2, 3])], parent_chain=[], project_root=Path("/root")
+        )
+        assert st.symbols["Model.get"].start_line == 3
+        assert st.symbols["model.get"].start_line == 1
+
+    def test_an_alias_never_takes_a_name_another_declaration_holds(self):
+        st = SymbolTable(_make_adapter())
+        function = {"name": "get", "kind": NodeType.FUNCTION, "range": self._span(0)}
+        st.register_symbols(
+            Path("model.ts"), [function, self._class("Model", [2, 3])], parent_chain=[], project_root=Path("/root")
+        )
+        assert st.symbols["model.get"].kind == NodeType.FUNCTION
+        assert st.symbols["model.get"].start_line == 0
+
+    def test_a_different_kind_under_the_same_name_keeps_the_alias_on_the_first(self):
+        st = SymbolTable(_make_adapter())
+        members = [
+            {"name": "add", "kind": NodeType.CONSTANT, "range": self._span(2)},
+            {"name": "add", "kind": NodeType.PROPERTY, "range": self._span(7)},
+        ]
+        span = {"start": {"line": 0, "character": 0}, "end": {"line": 9, "character": 0}}
+        hook = {"name": "useChat", "kind": NodeType.CLASS, "range": span, "children": members}
+        st.register_symbols(Path("mod.ts"), [hook], parent_chain=[], project_root=Path("/root"))
+        assert st.symbols["useChat.add"].start_line == 7
+        assert st.symbols["mod.add"].start_line == 2
+
+    @staticmethod
+    def _span(line: int) -> dict:
+        return {"start": {"line": line, "character": 2}, "end": {"line": line, "character": 20}}
+
+    def _class(self, name: str, overload_lines: list[int]) -> dict:
+        overloads = [{"name": "get", "kind": NodeType.METHOD, "range": self._span(line)} for line in overload_lines]
+        span = {"start": {"line": 0, "character": 0}, "end": {"line": 9, "character": 0}}
+        return {"name": name, "kind": NodeType.CLASS, "range": span, "children": overloads}
+
+    def test_skips_symbols_with_empty_name(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        symbols = [
+            {
+                "name": "",
+                "kind": NodeType.FUNCTION,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 0}},
+            }
+        ]
+        st.register_symbols(Path("mod.py"), symbols, parent_chain=[], project_root=Path("/root"))
+        assert len(st.symbols) == 0
+
+
+# ---- build_indices ----
+
+
+class TestBuildIndices:
+    def test_builds_file_name_index(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym = _sym("foo", "mod.foo", NodeType.FUNCTION)
+        st._symbols["mod.foo"] = sym
+        st._file_symbols["mod.py"] = [sym]
+
+        st.build_indices()
+        assert ("mod.py", "foo") in st._file_name_index
+        assert st._file_name_index[("mod.py", "foo")] == [sym]
+
+    def test_builds_class_to_ctor_index(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        st.register_symbols(Path("mod.py"), _class_with_child("__init__", NodeType.CONSTRUCTOR), [], Path("/root"))
+
+        st.build_indices()
+        assert st._class_to_ctors["mod.MyClass"] == ["MyClass.__init__"]
+
+    def test_indexes_only_constructors(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        st.register_symbols(Path("mod.py"), _class_with_child("do_stuff", NodeType.METHOD), [], Path("/root"))
+
+        st.build_indices()
+        assert "mod.MyClass" not in st._class_to_ctors
+
+    def test_does_not_index_the_alias_beside_its_constructor(self):
+        """The unqualified alias shares the constructor's kind but declares no owner."""
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        st.register_symbols(Path("mod.py"), _class_with_child("__init__", NodeType.CONSTRUCTOR), [], Path("/root"))
+
+        st.build_indices()
+        assert sum(len(ctors) for ctors in st._class_to_ctors.values()) == 1
+
+
+class TestRegisterKnown:
+    def test_a_known_declaration_resolves_but_is_not_this_builds_own(self):
+        st = SymbolTable(_make_adapter())
+        known = _sym("helper", "lib.helper", NodeType.FUNCTION, "lib.py", 3, 4, 4)
+
+        st.register_known([known])
+
+        assert st.symbols["lib.helper"] is known
+        assert st.file_symbols["lib.py"] == [known]
+        assert st.primary_file_symbols == {}
+        assert st.known == [known]
+
+    def test_a_name_the_build_read_itself_keeps_its_own_symbol(self):
+        st = SymbolTable(_make_adapter())
+        st.register_symbols(Path("mod.py"), _class_with_child("run", NodeType.METHOD), [], Path("/root"))
+
+        st.register_known([_sym("MyClass", "mod.MyClass", NodeType.CLASS, "other.py")])
+
+        assert st.symbols["mod.MyClass"].file_path == Path("mod.py")
+        assert st.known == []
+
+    def test_a_known_constructor_is_indexed_under_its_class(self):
+        """A full build expands a construction to its constructors; a warm start must too."""
+        st = SymbolTable(_make_adapter())
+        ctor = _sym("__init__", "lib.Box.__init__", NodeType.CONSTRUCTOR, "lib.py", 2, 8, 3)
+        ctor.owner_qualified_name = "lib.Box"
+
+        st.register_known([ctor])
+        st.build_indices()
+
+        assert st.class_to_ctors["lib.Box"] == ["lib.Box.__init__"]
+
+
+# ---- find_containing_symbol ----
+
+
+class TestFindContainingSymbol:
+    def test_finds_innermost_symbol(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        outer = _sym("outer", "mod.outer", NodeType.FUNCTION, start_line=0, end_line=20, end_char=0)
+        inner = _sym("inner", "mod.outer.inner", NodeType.FUNCTION, start_line=5, end_line=10, end_char=0)
+        st._file_symbols["mod.py"] = [outer, inner]
+
+        result = st.find_containing_symbol(Path("mod.py"), 7, 4)
+        assert result is not None
+        assert result.qualified_name == "mod.outer.inner"
+
+    def test_returns_none_for_no_match(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym = _sym("foo", "mod.foo", NodeType.FUNCTION, start_line=0, end_line=5)
+        st._file_symbols["mod.py"] = [sym]
+
+        result = st.find_containing_symbol(Path("mod.py"), 10, 0)
+        assert result is None
+
+    def test_returns_none_for_unknown_file(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+
+        result = st.find_containing_symbol(Path("unknown.py"), 0, 0)
+        assert result is None
+
+    def test_a_gap_between_members_belongs_to_the_class(self):
+        """Containment is a range question; which member a decoration belongs to is not.
+
+        The parse tree answers the second one, in ``SourceInspector.attribution_position``.
+        """
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        cls = _sym("C", "mod.C", NodeType.CLASS, start_line=0, end_line=30)
+        method = _sym("m", "mod.C.m", NodeType.METHOD, start_line=5, end_line=15)
+        st._file_symbols["mod.py"] = [cls, method]
+
+        result = st.find_containing_symbol(Path("mod.py"), 3, 4)
+        assert result is not None
+        assert result.qualified_name == "mod.C"
+
+
+# ---- lift_to_callable ----
+
+
+class TestLiftToCallable:
+    def test_callable_returns_self(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym = _sym("foo", "mod.foo", NodeType.FUNCTION)
+        st._file_symbols["mod.py"] = [sym]
+
+        result = st.lift_to_callable(sym)
+        assert result is sym
+
+    def test_class_returns_self(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym = _sym("C", "mod.C", NodeType.CLASS)
+        st._file_symbols["mod.py"] = [sym]
+
+        result = st.lift_to_callable(sym)
+        assert result is sym
+
+    def test_variable_lifts_to_enclosing_function(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        func = _sym("foo", "mod.foo", NodeType.FUNCTION, start_line=0, end_line=20)
+        var = _sym("x", "mod.foo.x", NodeType.VARIABLE, start_line=5, end_line=5)
+        st._file_symbols["mod.py"] = [func, var]
+
+        result = st.lift_to_callable(var)
+        assert result is not None
+        assert result.qualified_name == "mod.foo"
+
+    def test_variable_with_no_enclosing_returns_self(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        var = _sym("x", "mod.x", NodeType.VARIABLE, start_line=0, end_line=0)
+        st._file_symbols["mod.py"] = [var]
+
+        result = st.lift_to_callable(var)
+        assert result is var
+
+
+# ---- get_equivalent_names ----
+
+
+class TestGetEquivalentNames:
+    def test_returns_equivalent_names(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym1 = _sym("foo", "mod.foo", NodeType.FUNCTION)
+        sym2 = _sym("foo", "mod.C.foo", NodeType.FUNCTION)
+        st._symbols["mod.foo"] = sym1
+        st._symbols["mod.C.foo"] = sym2
+        st._file_symbols["mod.py"] = [sym1, sym2]
+        st.build_indices()
+
+        eqs = st.get_equivalent_names("mod.foo")
+        assert "mod.C.foo" in eqs
+
+    def test_returns_empty_for_unknown(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        assert st.get_equivalent_names("nonexistent") == []
+
+
+# ---- get_canonical_name ----
+
+
+class TestGetCanonicalName:
+    def test_returns_shortest_equivalent(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym1 = _sym("foo", "mod.foo", NodeType.FUNCTION)
+        sym2 = _sym("foo", "mod.C.foo", NodeType.FUNCTION)
+        st._symbols["mod.foo"] = sym1
+        st._symbols["mod.C.foo"] = sym2
+        st._file_symbols["mod.py"] = [sym1, sym2]
+        st.build_indices()
+
+        assert st.get_canonical_name("mod.C.foo") == "mod.foo"
+
+    def test_returns_self_for_no_equivalents(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym1 = _sym("bar", "mod.bar", NodeType.FUNCTION)
+        st._symbols["mod.bar"] = sym1
+        st._file_symbols["mod.py"] = [sym1]
+        st.build_indices()
+
+        assert st.get_canonical_name("mod.bar") == "mod.bar"
+
+    def test_returns_identity_for_unknown(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        assert st.get_canonical_name("missing") == "missing"
+
+
+# ---- is_local_variable ----
+
+
+class TestIsLocalVariable:
+    def test_module_level_variable_is_not_local(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym = _sym("handler", "mod.handler", NodeType.VARIABLE)
+        sym.parent_chain = []
+        st._file_symbols["mod.py"] = [sym]
+
+        assert st.is_local_variable(sym) is False
+
+    def test_variable_with_parent_is_local(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym = _sym("x", "mod.foo.x", NodeType.VARIABLE)
+        sym.parent_chain = [("foo", NodeType.FUNCTION)]
+        st._file_symbols["mod.py"] = [sym]
+
+        assert st.is_local_variable(sym) is True
+
+    def test_constant_with_parent_is_local(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym = _sym("MAX", "mod.foo.MAX", NodeType.CONSTANT)
+        sym.parent_chain = [("foo", NodeType.FUNCTION)]
+
+        assert st.is_local_variable(sym) is True
+
+    def test_property_inside_callable_is_local(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym = _sym("prop", "mod.foo.prop", NodeType.PROPERTY)
+        sym.parent_chain = [("foo", NodeType.FUNCTION)]
+
+        assert st.is_local_variable(sym) is True
+
+    def test_property_inside_class_is_not_local(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym = _sym("prop", "mod.C.prop", NodeType.PROPERTY)
+        sym.parent_chain = [("C", NodeType.CLASS)]
+
+        assert st.is_local_variable(sym) is False
+
+    def test_function_is_never_local(self):
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        sym = _sym("foo", "mod.foo", NodeType.FUNCTION)
+        sym.parent_chain = []
+
+        assert st.is_local_variable(sym) is False
+
+    def test_unqualified_alias_at_same_position_is_local(self):
+        """An alias (no parent_chain) at the same position as a parented symbol is local."""
+        adapter = _make_adapter()
+        st = SymbolTable(adapter)
+        # The alias has no parent_chain itself, but shares position with a parented symbol
+        alias = _sym("x", "mod.x", NodeType.VARIABLE, start_line=5, start_char=8)
+        alias.parent_chain = []
+        parented = _sym("x", "mod.foo.x", NodeType.VARIABLE, start_line=5, start_char=8)
+        parented.parent_chain = [("foo", NodeType.FUNCTION)]
+        st._file_symbols["mod.py"] = [alias, parented]
+
+        assert st.is_local_variable(alias) is True

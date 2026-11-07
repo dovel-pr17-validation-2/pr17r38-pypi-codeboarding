@@ -1,0 +1,193 @@
+"""Warm-start can be scoped git-free from a caller-supplied changed-file set.
+
+The wrapper analyses a frozen, non-git COPY of the working tree, so the git
+``get_changed_files_since`` path can't run there. When the analyzer is built with
+a changed-file set (its fingerprint diff), ``_update_cached_results`` must use it
+directly and never touch git.
+"""
+
+import unittest
+from pathlib import Path
+from typing import cast
+from unittest.mock import MagicMock, patch
+
+from static_analyzer import EngineConfig, StaticAnalyzer
+from static_analyzer.analysis_result import StaticAnalysisResults
+
+
+def _analyzer_with_one_engine(project_path: Path, changed_files: set[Path] | None) -> StaticAnalyzer:
+    analyzer = object.__new__(StaticAnalyzer)
+    analyzer.repository_path = project_path
+    analyzer._server_slots = 0
+    adapter = MagicMock()
+    adapter.language = "Python"
+    adapter.language_enum = MagicMock()
+    adapter.rebuilds_for.return_value = False
+    client = MagicMock()
+    analyzer._engine_clients = [(EngineConfig(adapter=adapter, project_path=project_path), client)]
+    analyzer.collected_diagnostics = {}
+    analyzer.ignore_manager = MagicMock()
+    analyzer._loc_for_adapter = MagicMock(return_value=0)
+    analyzer.changed_files = changed_files
+    return analyzer
+
+
+class TestWarmStartChangedFiles(unittest.TestCase):
+    def setUp(self) -> None:
+        self.project = Path("/proj").resolve()
+        self.cached = StaticAnalysisResults()
+
+    @patch("static_analyzer.update_cfg_for_changed_files", return_value={})
+    @patch("static_analyzer.get_changed_files_since")
+    def test_supplied_changed_files_bypass_git(self, mock_git, mock_update) -> None:
+        supplied = {self.project / "a.py", self.project / "b.py"}
+        analyzer = _analyzer_with_one_engine(self.project, changed_files=supplied)
+        with (
+            patch.object(analyzer, "_extract_language_dict", return_value={}),
+            patch.object(analyzer, "_absorb_into_results"),
+            patch.object(analyzer, "_collect_diagnostics_for"),
+            patch("static_analyzer.track_lsp_result"),
+        ):
+            analyzer._update_cached_results(self.cached, cached_sha="deadbeef")
+
+        # Git is never consulted on the supplied path.
+        mock_git.assert_not_called()
+        # The supplied set (scoped to this engine's project root) reaches the merger.
+        passed = (
+            mock_update.call_args.args[1]
+            if mock_update.call_args.args
+            else mock_update.call_args.kwargs["changed_files"]
+        )
+        self.assertEqual(passed, supplied)
+
+    @patch("static_analyzer.update_cfg_for_changed_files", return_value={})
+    @patch("static_analyzer.get_changed_files_since")
+    def test_files_outside_project_root_are_scoped_out(self, mock_git, mock_update) -> None:
+        inside = self.project / "keep.py"
+        outside = Path("/other/repo/skip.py").resolve()
+        analyzer = _analyzer_with_one_engine(self.project, changed_files={inside, outside})
+        with (
+            patch.object(analyzer, "_extract_language_dict", return_value={}),
+            patch.object(analyzer, "_absorb_into_results"),
+            patch.object(analyzer, "_collect_diagnostics_for"),
+            patch("static_analyzer.track_lsp_result"),
+        ):
+            analyzer._update_cached_results(self.cached, cached_sha="deadbeef")
+        mock_git.assert_not_called()
+        passed = (
+            mock_update.call_args.args[1]
+            if mock_update.call_args.args
+            else mock_update.call_args.kwargs["changed_files"]
+        )
+        self.assertEqual(passed, {inside})
+
+    @patch("static_analyzer.get_changed_files_since")
+    def test_engine_configs_of_one_language_thread_one_dict_and_absorb_once(self, mock_git) -> None:
+        """Why: a config that copies the cache hands back the nodes another config invalidated."""
+        analyzer = _analyzer_with_one_engine(self.project, changed_files={self.project / "a.py"})
+        ((config, client),) = analyzer._engine_clients
+        analyzer._engine_clients.append(
+            (EngineConfig(adapter=config.adapter, project_path=self.project / "sub"), client)
+        )
+        first, second = {"call_graph": "first"}, {"call_graph": "second"}
+        with (
+            patch("static_analyzer.update_cfg_for_changed_files", side_effect=[first, second]) as mock_update,
+            patch.object(analyzer, "_extract_language_dict", return_value={"call_graph": "cached"}) as extract,
+            patch.object(analyzer, "_absorb_into_results") as absorb,
+            patch.object(analyzer, "_collect_diagnostics_for"),
+            patch("static_analyzer.track_lsp_result"),
+        ):
+            analyzer._update_cached_results(self.cached, cached_sha="deadbeef")
+        mock_git.assert_not_called()
+        extract.assert_called_once()
+        self.assertIs(mock_update.call_args_list[1].args[0], first)
+        absorb.assert_called_once()
+        self.assertIs(absorb.call_args.args[2], second)
+
+    def test_discovery_exclusions_scope_supplied_and_git_changes_before_invalidation(self) -> None:
+        inner_root = self.project / "plugins"
+        excluded = inner_root / "Inner"
+        inner_changes = {excluded / name for name in ("modified.cs", "added.cs", "deleted.cs")}
+        outer_changes = {self.project / "Outer.cs", self.project / "plugins-extra" / "Other.cs"}
+        for use_git in (False, True):
+            with self.subTest(use_git=use_git):
+                analyzer = _analyzer_with_one_engine(
+                    self.project, changed_files=None if use_git else inner_changes | outer_changes
+                )
+                ((outer, client),) = analyzer._engine_clients
+                outer.excluded_roots = [excluded]
+                outer.source_files = [self.project / "Unchanged.cs"]
+                inner = EngineConfig(outer.adapter, inner_root, source_files=[excluded / "modified.cs"])
+                analyzer._engine_clients.append((inner, client))
+                with (
+                    patch(
+                        "static_analyzer.get_changed_files_since",
+                        side_effect=[inner_changes | outer_changes, inner_changes],
+                    ),
+                    patch("static_analyzer.update_cfg_for_changed_files", return_value={}) as update,
+                    patch.object(analyzer, "_extract_language_dict", return_value={}),
+                    patch.object(analyzer, "_absorb_into_results"),
+                    patch.object(analyzer, "_collect_diagnostics_for"),
+                    patch("static_analyzer.track_lsp_result"),
+                ):
+                    analyzer._update_cached_results(self.cached, cached_sha="baseline")
+                self.assertEqual(update.call_args_list[0].args[1], outer_changes)
+                # Added/deleted paths are absent from source_files but still belong to the inner engine.
+                self.assertEqual(update.call_args_list[1].args[1], inner_changes)
+
+    @patch("static_analyzer.update_cfg_for_changed_files", return_value={})
+    @patch("static_analyzer.get_changed_files_since", return_value={Path("/proj/x.py")})
+    def test_none_falls_back_to_git(self, mock_git, mock_update) -> None:
+        analyzer = _analyzer_with_one_engine(self.project, changed_files=None)
+        with (
+            patch.object(analyzer, "_extract_language_dict", return_value={}),
+            patch.object(analyzer, "_absorb_into_results"),
+            patch.object(analyzer, "_collect_diagnostics_for"),
+            patch("static_analyzer.track_lsp_result"),
+        ):
+            analyzer._update_cached_results(self.cached, cached_sha="HEAD~1")
+        # No supplied set => git IS consulted (legacy CLI-on-a-real-checkout path).
+        mock_git.assert_called_once()
+
+    @patch("static_analyzer.update_cfg_for_changed_files", return_value={})
+    @patch("static_analyzer.get_changed_files_since", side_effect=RuntimeError("Invalid Git repository"))
+    def test_git_failure_falls_back_to_full_relsp(self, mock_git, mock_update) -> None:
+        # When git fails (non-git dir / bad sha) and nothing was supplied, the
+        # language re-LSPs fully rather than crashing.
+        analyzer = _analyzer_with_one_engine(self.project, changed_files=None)
+        with (
+            patch.object(analyzer, "_extract_language_dict", return_value={}),
+            patch.object(analyzer, "_run_full_analysis", return_value={}) as mock_full,
+            patch.object(analyzer, "_absorb_into_results"),
+            patch.object(analyzer, "_collect_diagnostics_for"),
+            patch("static_analyzer.track_lsp_result"),
+        ):
+            analyzer._update_cached_results(self.cached, cached_sha="badsha")
+        mock_full.assert_called_once()
+        mock_update.assert_not_called()
+
+    @patch("static_analyzer.update_cfg_for_changed_files", return_value={})
+    def test_a_change_that_alters_how_imports_resolve_rebuilds_on_a_fresh_server(self, mock_update) -> None:
+        analyzer = _analyzer_with_one_engine(self.project, changed_files={self.project / "pnpm-workspace.yaml"})
+        [(config, stale)] = analyzer._engine_clients
+        adapter, stale_client = cast(MagicMock, config.adapter), cast(MagicMock, stale)
+        adapter.rebuilds_for.return_value = True
+        stale_client.shutdown.side_effect = lambda: setattr(stale_client, "alive", False)
+        fresh = MagicMock()
+        with (
+            patch.object(analyzer, "_spawn_engine_client", return_value=fresh),
+            patch.object(analyzer, "_run_full_analysis", return_value={}) as mock_full,
+            patch.object(analyzer, "_absorb_into_results"),
+            patch.object(analyzer, "_collect_diagnostics_for"),
+            patch("static_analyzer.track_lsp_result"),
+        ):
+            analyzer._update_cached_results(self.cached, cached_sha="deadbeef")
+
+        stale_client.shutdown.assert_called()
+        mock_full.assert_called_once_with(config, fresh)
+        mock_update.assert_not_called()
+        self.assertEqual(analyzer._engine_clients, [(config, fresh)])
+
+
+if __name__ == "__main__":
+    unittest.main()

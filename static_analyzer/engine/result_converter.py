@@ -1,0 +1,236 @@
+"""Bridge between engine models and CodeBoarding's CallGraph/Node/Edge models."""
+
+from __future__ import annotations
+
+import logging
+
+from collections import Counter
+from dataclasses import replace
+from pathlib import Path
+
+from infra.repo_utils.ignore import RepoIgnoreManager
+from static_analyzer.config import CLASS_TYPES, GRAPH_NODE_TYPES, NodeType
+from static_analyzer.engine.language_adapter import LanguageAdapter
+from static_analyzer.engine.models import ExternalCallSite, LanguageAnalysisResult, SymbolInfo
+from static_analyzer.engine.symbol_table import SymbolTable
+from static_analyzer.cfg import CallGraph, EdgeKind, ReferenceEdge
+from static_analyzer.node import Node
+
+logger = logging.getLogger(__name__)
+
+
+def convert_to_codeboarding_format(
+    symbol_table: SymbolTable,
+    result: LanguageAnalysisResult,
+    adapter: LanguageAdapter,
+    ignore_manager: RepoIgnoreManager | None = None,
+) -> dict:
+    """Convert engine analysis results to the dict shape expected by StaticAnalyzer.analyze().
+
+    ``ignore_manager`` drops symbols in ignored files at the source: the LSP indexes the
+    whole workspace, including test directories the file walk excludes, so without this a
+    test symbol enters the call graph and gets clustered, described, and related. Filtering
+    here keeps ignored files out of every downstream artifact — components, relations, the
+    file index — and, because the analysis never reasons about them, makes it faster.
+
+    Returns a dict with keys:
+        - call_graph: CallGraph (CodeBoarding's graph.py model)
+        - class_hierarchies: dict
+        - package_relations: dict
+        - references: list[Node]
+        - source_files: list[str]
+        - diagnostics: dict (analysis limitations; server diagnostics are collected separately)
+    """
+    language = adapter.language
+    call_graph = CallGraph(language=language)
+
+    def is_ignored(file_path: object) -> bool:
+        return ignore_manager is not None and ignore_manager.should_ignore(Path(str(file_path)))
+
+    # Collect all symbol names that participate in edges so we include them as nodes
+    edge_participants: set[str] = set()
+    for edge in result.cfg.edges:
+        edge_participants.add(edge.source)
+        edge_participants.add(edge.destination)
+
+    # Build Node objects from the engine's symbol table
+    symbol_nodes: dict[str, Node] = {}
+    known = {sym.qualified_name for sym in symbol_table.known}
+    for qname, sym in symbol_table.symbols.items():
+        # A declaration known only from the cache is output only as an edge's endpoint; the cache keeps its node.
+        if qname in known and qname not in edge_participants:
+            continue
+        node_type = _map_symbol_kind(sym.kind)
+        # Include symbols that are graph node types OR that participate in edges
+        if node_type not in GRAPH_NODE_TYPES and qname not in edge_participants:
+            continue
+        if is_ignored(sym.file_path):
+            continue
+
+        node = _node(sym)
+        symbol_nodes[qname] = node
+        call_graph.add_node(node)
+
+    # Add edges from the engine's CFG
+    edges_added = 0
+    edges_skipped = 0
+    for edge in result.cfg.edges:
+        src = edge.source
+        dst = edge.destination
+        if call_graph.has_node(src) and call_graph.has_node(dst):
+            try:
+                if edge.call_sites:
+                    call_graph.add_edge(
+                        src,
+                        dst,
+                        call_sites=[
+                            {"file": site.file, "line": site.line, "column": site.column} for site in edge.call_sites
+                        ],
+                    )
+                else:
+                    logger.warning(
+                        "edge_with_no_site language=%s source=%s destination=%s",
+                        language,
+                        src,
+                        dst,
+                    )
+                    call_graph.add_edge(src, dst)
+                edges_added += 1
+            except ValueError:
+                edges_skipped += 1
+        else:
+            edges_skipped += 1
+
+    logger.info(
+        "Converted %d nodes, %d edges (%d skipped) for %s",
+        len(call_graph.nodes),
+        edges_added,
+        edges_skipped,
+        language,
+    )
+
+    _add_reference_edges(call_graph, result, known)
+
+    logger.info(
+        "Reference edges for %s: %d (%s)",
+        language,
+        len(call_graph.reference_edges),
+        dict(_count_by_kind(call_graph.reference_edges)),
+    )
+
+    # Build references list from primary symbols only (excludes dual-registration
+    # aliases and local variables/parameters that are implementation noise).
+    primary_qnames: set[str] = set()
+    for syms in symbol_table.primary_file_symbols.values():
+        for sym in syms:
+            primary_qnames.add(sym.qualified_name)
+
+    references: list[Node] = []
+    seen_refs: set[str] = set()
+    for qname in sorted(primary_qnames):
+        sym = symbol_table.symbols[qname]
+        if not adapter.is_reference_worthy(sym.kind):
+            continue
+        if symbol_table.is_local_variable(sym):
+            continue
+        if is_ignored(sym.file_path):
+            continue
+        if qname in seen_refs:
+            continue
+        seen_refs.add(qname)
+
+        # Reuse existing node if in the graph, otherwise create a new one
+        references.append(symbol_nodes[qname] if qname in symbol_nodes else _node(sym))
+
+    # A call into another engine's file is linked once the graphs are merged. Its caller may be no node here
+    # (a constant, a local): it goes along, and becomes a node only if the call links, as it would here.
+    external_call_sites: list[ExternalCallSite] = []
+    external_callers: dict[str, Node] = {}
+    for site in result.external_call_sites:
+        caller = call_graph.canonical_name(site.caller)
+        if not call_graph.has_node(caller):
+            sym = symbol_table.symbols.get(caller)
+            if sym is None or is_ignored(sym.file_path):
+                continue
+            external_callers.setdefault(caller, _node(sym))
+        external_call_sites.append(replace(site, caller=caller))
+
+    return {
+        "call_graph": call_graph,
+        "class_hierarchies": result.hierarchy,
+        "package_relations": result.package_dependencies,
+        "references": references,
+        "source_files": result.source_files,
+        "diagnostics": result.diagnostics,
+        "external_call_sites": external_call_sites,
+        "external_callers": list(external_callers.values()),
+    }
+
+
+def _node(sym: SymbolInfo) -> Node:
+    return Node(
+        fully_qualified_name=sym.qualified_name,
+        node_type=_map_symbol_kind(sym.kind),
+        file_path=str(sym.file_path),
+        line_start=sym.start_line + 1,
+        line_end=sym.end_line + 1,
+        col_start=sym.start_char,
+        symbol_name=sym.name if sym.explicit_identity else "",
+        owner_qualified_name=sym.owner_qualified_name if sym.explicit_identity else "",
+        explicit_identity=sym.explicit_identity,
+    )
+
+
+def _add_reference_edges(call_graph: CallGraph, result: LanguageAnalysisResult, known: set[str]) -> None:
+    """Complete the graph with non-call relationship edges (see ``EdgeKind``).
+
+    CONTAINS and INHERITS need no extra LSP work — they come from the qualified-name
+    hierarchy and the already-computed class hierarchy. TYPEREF and IMPORT are read
+    from the engine result when the analyzer populated them.
+    """
+    class_qnames = {qname for qname, node in call_graph.nodes.items() if node.type in CLASS_TYPES}
+
+    # CONTAINS: each method / nested symbol -> its innermost enclosing class node.
+    for qname, node in call_graph.nodes.items():
+        if qname in class_qnames or qname in known:
+            continue
+        owner = node.owner_qualified_name
+        while owner in call_graph.nodes and owner not in class_qnames:
+            owner = call_graph.nodes[owner].owner_qualified_name
+        if owner in class_qnames:
+            call_graph.add_reference_edge(ReferenceEdge(qname, owner, EdgeKind.CONTAINS))
+            continue
+        parts = qname.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            parent = ".".join(parts[:i])
+            if parent in class_qnames:
+                call_graph.add_reference_edge(ReferenceEdge(qname, parent, EdgeKind.CONTAINS))
+                break
+
+    # INHERITS: child class -> each superclass (already computed by HierarchyBuilder).
+    for child, info in (result.hierarchy or {}).items():
+        for superclass in info.get("superclasses", []):
+            call_graph.add_reference_edge(ReferenceEdge(child, superclass, EdgeKind.INHERITS))
+
+    # TYPEREF / IMPORT: no engine populates these yet, so both loops are empty in
+    # production. Kept so an engine that starts emitting them needs no converter change.
+    for src, dst in result.type_references:
+        call_graph.add_reference_edge(ReferenceEdge(src, dst, EdgeKind.TYPEREF))
+    for src, dst in result.import_edges:
+        call_graph.add_reference_edge(ReferenceEdge(src, dst, EdgeKind.IMPORT))
+
+
+def _count_by_kind(reference_edges: list[ReferenceEdge]) -> Counter:
+    return Counter(ref.kind for ref in reference_edges)
+
+
+def _map_symbol_kind(kind: int) -> NodeType:
+    """Map an LSP SymbolKind integer to CodeBoarding's NodeType.
+
+    Since NodeType uses the same integer values as LSP SymbolKind,
+    this is a direct conversion with a fallback to FUNCTION.
+    """
+    try:
+        return NodeType(kind)
+    except ValueError:
+        return NodeType.FUNCTION

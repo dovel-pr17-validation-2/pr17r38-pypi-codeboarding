@@ -1,0 +1,853 @@
+"""Tests for the C# language adapter."""
+
+import logging
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+from xml.etree import ElementTree
+
+import pytest
+
+from static_analyzer.config import Language, NodeType
+from static_analyzer.dotnet_sdk import DotnetSdkError, DotnetSdkResolution
+from static_analyzer.engine.adapters.csharp_adapter import CSharpAdapter
+from static_analyzer.engine.source_inspector import SourceInspector
+from static_analyzer.exceptions import WorkspaceSetupError
+
+
+def _dotnet_resolution(dotnet_path: str = "/usr/bin/dotnet", env: dict[str, str] | None = None) -> DotnetSdkResolution:
+    return DotnetSdkResolution(dotnet_path=dotnet_path, env=env or {}, source="system")
+
+
+class TestStandaloneWorkspace:
+    def test_links_only_selected_sources_without_changing_repository(self, tmp_path, caplog):
+        source = tmp_path / "Helper & tools.cs"
+        source.write_text("class Helper { public static void Run() {} }")
+        ignored = tmp_path / "Ignored.cs"
+        ignored.write_text("class Ignored {}")
+        dependencies = tmp_path / "node_modules"
+        dependencies.mkdir()
+        (dependencies / "Unused.csproj").write_text("<Project />")
+        adapter = CSharpAdapter()
+        with (
+            patch(
+                "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+                return_value=_dotnet_resolution(),
+            ),
+            patch(
+                "static_analyzer.engine.adapters.csharp_adapter.subprocess.run", return_value=MagicMock(returncode=0)
+            ),
+            patch.object(adapter, "_ensure_csharp_ls_installed"),
+            caplog.at_level(logging.WARNING),
+        ):
+            folders = adapter.workspace_folders(tmp_path, [source])
+            command = adapter.get_lsp_command(tmp_path)
+
+        assert folders == [tmp_path]
+        solution_path = Path(command[command.index("--solution") + 1])
+        assert not solution_path.is_relative_to(tmp_path)
+        solution = ElementTree.parse(solution_path)
+        project_path = solution.find("Project")
+        assert project_path is not None
+        project = ElementTree.parse(solution_path.parent / project_path.attrib["Path"])
+        assert [item.attrib["Include"] for item in project.findall("ItemGroup/Compile")] == [str(source)]
+        assert project.findtext("PropertyGroup/EnableDefaultCompileItems") == "false"
+        assert project.findtext("PropertyGroup/TargetFramework") == "net10.0"
+        for name in ("Directory.Build.props", "Directory.Build.targets"):
+            build_import = ElementTree.parse(solution_path.parent / name).getroot()
+            assert build_import.tag == "Project"
+            assert not build_import.attrib and len(build_import) == 0
+        assert set(tmp_path.iterdir()) == {source, ignored, dependencies}
+        assert "inferred" in caplog.text
+
+        (tmp_path / "Real.csproj").write_text("<Project />")
+        assert adapter.workspace_folders(tmp_path, [source]) == []
+        assert not solution_path.exists()
+        with (
+            patch(
+                "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+                return_value=_dotnet_resolution(),
+            ),
+            patch.object(adapter, "_ensure_csharp_ls_installed"),
+        ):
+            assert "--solution" not in adapter.get_lsp_command(tmp_path)
+
+    @pytest.mark.parametrize("name", ["Broken.sln", "Broken.slnx", "Broken.csproj", "nested/Broken.csproj"])
+    def test_existing_project_is_not_replaced(self, tmp_path, name):
+        project = tmp_path / name
+        project.parent.mkdir(parents=True, exist_ok=True)
+        project.write_text("broken project")
+        source = tmp_path / "Helper.cs"
+        source.write_text("class Helper {}")
+        assert CSharpAdapter().workspace_folders(tmp_path, [source]) == []
+
+    def test_restore_failure_is_not_successful_empty_analysis(self, tmp_path):
+        source = tmp_path / "Helper.cs"
+        source.write_text("class Helper {}")
+        adapter = CSharpAdapter()
+        with (
+            patch(
+                "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+                return_value=_dotnet_resolution(),
+            ),
+            patch(
+                "static_analyzer.engine.adapters.csharp_adapter.subprocess.run",
+                return_value=MagicMock(returncode=1, stdout="restore failed", stderr=""),
+            ),
+            pytest.raises(WorkspaceSetupError, match="Could not restore the standalone C# analysis project"),
+        ):
+            adapter.workspace_folders(tmp_path, [source])
+
+
+class TestGetLspCommandDotnetCheck:
+    """``get_lsp_command`` must reject hosts without the .NET SDK.
+
+    csharp-ls is a ``dotnet tool`` and cannot run without the runtime,
+    so a missing ``dotnet`` produces a silently broken analysis. We
+    surface that as a clear RuntimeError at LSP-launch, mirroring how
+    ``RustAdapter`` enforces a cargo toolchain.
+    """
+
+    def test_raises_when_sdk_cannot_be_resolved(self, tmp_path: Path) -> None:
+        with patch(
+            "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+            side_effect=DotnetSdkError(".NET SDK not found"),
+        ):
+            with pytest.raises(RuntimeError, match=r"\.NET SDK not found"):
+                CSharpAdapter().get_lsp_command(tmp_path)
+
+    def test_returns_command_when_dotnet_present(self, tmp_path: Path) -> None:
+        resolved = "/opt/codeboarding/pm-tools/csharp/csharp-ls"
+        lsp_servers = {"csharp": {"command": [resolved]}}
+
+        with (
+            patch(
+                "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+                return_value=_dotnet_resolution("/usr/local/bin/dotnet"),
+            ),
+            patch.object(CSharpAdapter, "_ensure_csharp_ls_installed"),
+            patch("static_analyzer.engine.language_adapter.get_config", return_value=lsp_servers),
+        ):
+            cmd = CSharpAdapter().get_lsp_command(tmp_path)
+        assert cmd[0] == resolved
+
+
+class TestCSharpAdapterProperties:
+    """Tests for basic adapter properties."""
+
+    def test_language(self):
+        adapter = CSharpAdapter()
+        assert adapter.language == "CSharp"
+
+    def test_file_extensions(self):
+        adapter = CSharpAdapter()
+        assert adapter.file_extensions == (".cs",)
+
+    def test_language_enum(self):
+        assert CSharpAdapter().language_enum is Language.CSHARP
+
+    def test_lsp_command(self):
+        adapter = CSharpAdapter()
+        cmd = adapter.lsp_command
+        assert len(cmd) == 1
+        assert cmd[0].endswith("csharp-ls")
+
+    def test_language_id(self):
+        adapter = CSharpAdapter()
+        assert adapter.language_id == "csharp"
+
+    def test_fails_on_empty_symbols(self):
+        adapter = CSharpAdapter()
+        assert adapter.fail_on_empty_symbols is True
+
+    def test_config_key_defaults_to_language_id(self):
+        adapter = CSharpAdapter()
+        assert adapter.config_key == "csharp"
+
+
+class TestBuildQualifiedName:
+    """Tests for C#-specific qualified name construction."""
+
+    def setup_method(self):
+        self.adapter = CSharpAdapter()
+        self.root = Path("/repo")
+
+    def test_simple_symbol(self):
+        result = self.adapter.build_qualified_name(
+            file_path=Path("/repo/Program.cs"),
+            symbol_name="Main",
+            symbol_kind=NodeType.FUNCTION,
+            parent_chain=[],
+            project_root=self.root,
+        )
+        assert result == "Program.Main"
+
+    def test_nested_directory(self):
+        result = self.adapter.build_qualified_name(
+            file_path=Path("/repo/Services/Auth/AuthService.cs"),
+            symbol_name="Login",
+            symbol_kind=NodeType.METHOD,
+            parent_chain=[("AuthService", NodeType.CLASS)],
+            project_root=self.root,
+        )
+        # AuthService matches filename stem -> deduplicated
+        assert result == "Services.Auth.AuthService.Login"
+
+    def test_deduplicates_filename_class(self):
+        """When the first parent matches the filename, it should be stripped."""
+        result = self.adapter.build_qualified_name(
+            file_path=Path("/repo/Models/User.cs"),
+            symbol_name="Name",
+            symbol_kind=NodeType.PROPERTY,
+            parent_chain=[("User", NodeType.CLASS)],
+            project_root=self.root,
+        )
+        # User (parent) == User (file stem) -> deduplicated
+        assert result == "Models.User.Name"
+
+    def test_no_deduplication_when_different(self):
+        """When the first parent differs from filename, keep all parents."""
+        result = self.adapter.build_qualified_name(
+            file_path=Path("/repo/Helpers.cs"),
+            symbol_name="Validate",
+            symbol_kind=NodeType.METHOD,
+            parent_chain=[("StringHelper", NodeType.CLASS)],
+            project_root=self.root,
+        )
+        # StringHelper != Helpers -> no deduplication
+        assert result == "Helpers.StringHelper.Validate"
+
+    def test_deeply_nested_parents(self):
+        result = self.adapter.build_qualified_name(
+            file_path=Path("/repo/Controllers/UserController.cs"),
+            symbol_name="GetById",
+            symbol_kind=NodeType.METHOD,
+            parent_chain=[
+                ("UserController", NodeType.CLASS),
+                ("InnerClass", NodeType.CLASS),
+            ],
+            project_root=self.root,
+        )
+        # UserController matches file stem -> stripped, InnerClass kept
+        assert result == "Controllers.UserController.InnerClass.GetById"
+
+    def test_csharp_ls_hierarchy_skips_file_and_namespace(self):
+        """csharp-ls: File(kind=1) -> Namespace(kind=3) -> Class -> Method."""
+        result = self.adapter.build_qualified_name(
+            file_path=Path("/repo/src/Contoso.Processing/Download/DownloadService.cs"),
+            symbol_name="ProcessAsync",
+            symbol_kind=NodeType.METHOD,
+            parent_chain=[
+                ("DownloadService.cs", NodeType.FILE),
+                ("Download", NodeType.NAMESPACE),
+                ("DownloadService", NodeType.CLASS),
+            ],
+            project_root=self.root,
+        )
+        # File and Namespace skipped, DownloadService matches filename -> deduped
+        assert result == "src.Contoso.Processing.Download.DownloadService.ProcessAsync"
+
+    def test_namespace_symbol_uses_detail(self):
+        """Namespace symbols use their detail field as the qualified name."""
+        result = self.adapter.build_qualified_name(
+            file_path=Path("/repo/src/Contoso.Processing/Download/DownloadService.cs"),
+            symbol_name="Download",
+            symbol_kind=NodeType.NAMESPACE,
+            parent_chain=[("DownloadService.cs", NodeType.FILE)],
+            project_root=self.root,
+            detail="Contoso.Processing.Download",
+        )
+        assert result == "Contoso.Processing.Download"
+
+    def test_class_matching_filename_deduplicates(self):
+        """Class name == filename -> don't duplicate."""
+        result = self.adapter.build_qualified_name(
+            file_path=Path("/repo/src/Contoso.Api/Program.cs"),
+            symbol_name="Program",
+            symbol_kind=NodeType.CLASS,
+            parent_chain=[("Program.cs", NodeType.FILE)],
+            project_root=self.root,
+        )
+        assert result == "src.Contoso.Api.Program"
+
+    def test_src_is_a_directory_like_any_other(self):
+        """Every adapter spells the path from the repository root; nothing is dropped."""
+        result = self.adapter.build_qualified_name(
+            file_path=Path("/repo/src/Contoso.Core/Models/Media.cs"),
+            symbol_name="Media",
+            symbol_kind=NodeType.CLASS,
+            parent_chain=[],
+            project_root=self.root,
+        )
+        assert result == "src.Contoso.Core.Models.Media"
+
+
+class TestFilesDeclaringSeveralTypes:
+    """A C# file may declare several top-level types; the stem then names none of them."""
+
+    root = Path("/repo")
+
+    def _adapter_for(self, *type_names: str) -> CSharpAdapter:
+        adapter = CSharpAdapter()
+        adapter.record_document_symbols(
+            Path("/repo/Models/Animal.cs"),
+            [
+                {
+                    "name": "Zoo",
+                    "kind": NodeType.NAMESPACE,
+                    "children": [{"name": name, "kind": NodeType.CLASS} for name in type_names],
+                }
+            ],
+            self.root,
+        )
+        return adapter
+
+    def test_a_sibling_is_not_named_as_a_member_of_the_file_named_type(self):
+        adapter = self._adapter_for("Animal", "Dog")
+        source = Path("/repo/Models/Animal.cs")
+
+        animal = adapter.build_qualified_name(source, "Animal", NodeType.CLASS, [], self.root)
+        dog = adapter.build_qualified_name(source, "Dog", NodeType.CLASS, [], self.root)
+
+        assert animal == "Models.Animal.Animal"
+        assert dog == "Models.Animal.Dog"
+        assert not dog.startswith(animal + ".")
+
+    def test_a_sibling_no_longer_collides_with_a_nested_type(self):
+        """`Models.Animal.Inner` named both, and the second registration destroyed the first."""
+        adapter = self._adapter_for("Animal", "Inner")
+        source = Path("/repo/Models/Animal.cs")
+
+        nested = adapter.build_qualified_name(source, "Inner", NodeType.CLASS, [("Animal", NodeType.CLASS)], self.root)
+        sibling = adapter.build_qualified_name(source, "Inner", NodeType.CLASS, [], self.root)
+
+        assert nested == "Models.Animal.Animal.Inner"
+        assert sibling == "Models.Animal.Inner"
+        assert nested != sibling
+
+    def test_a_member_still_shares_a_prefix_with_its_class(self):
+        """CONTAINS is dot-prefix arithmetic, so the class must remain a prefix of its members."""
+        adapter = self._adapter_for("Animal", "Dog")
+        source = Path("/repo/Models/Animal.cs")
+
+        dog = adapter.build_qualified_name(source, "Dog", NodeType.CLASS, [], self.root)
+        speak = adapter.build_qualified_name(source, "Speak", NodeType.METHOD, [("Dog", NodeType.CLASS)], self.root)
+
+        assert speak == "Models.Animal.Dog.Speak"
+        assert speak.startswith(dog + ".")
+
+    def test_one_type_per_file_is_unchanged(self):
+        adapter = self._adapter_for("Animal")
+        source = Path("/repo/Models/Animal.cs")
+
+        assert adapter.build_qualified_name(source, "Animal", NodeType.CLASS, [], self.root) == "Models.Animal"
+        assert (
+            adapter.build_qualified_name(source, "Speak", NodeType.METHOD, [("Animal", NodeType.CLASS)], self.root)
+            == "Models.Animal.Speak"
+        )
+
+    def test_an_enum_beside_a_class_counts_as_a_second_type(self):
+        adapter = CSharpAdapter()
+        source = Path("/repo/Models/Task.cs")
+        adapter.record_document_symbols(
+            source,
+            [
+                {"name": "Task", "kind": NodeType.CLASS},
+                {"name": "Priority", "kind": NodeType.ENUM},
+            ],
+            self.root,
+        )
+
+        enum_name = adapter.build_qualified_name(source, "Priority", NodeType.ENUM, [], self.root)
+        property_name = adapter.build_qualified_name(
+            source, "Priority", NodeType.PROPERTY, [("Task", NodeType.CLASS)], self.root
+        )
+
+        assert enum_name == "Models.Task.Priority"
+        assert property_name == "Models.Task.Task.Priority"
+
+    def test_a_file_that_loses_a_sibling_goes_back_to_the_collapsed_name(self):
+        """The same adapter can re-analyse a file, and must agree with a cold run."""
+        adapter = self._adapter_for("Animal", "Dog")
+        source = Path("/repo/Models/Animal.cs")
+        assert adapter.build_qualified_name(source, "Animal", NodeType.CLASS, [], self.root) == "Models.Animal.Animal"
+
+        adapter.record_document_symbols(source, [{"name": "Animal", "kind": NodeType.CLASS}], self.root)
+
+        assert adapter.build_qualified_name(source, "Animal", NodeType.CLASS, [], self.root) == "Models.Animal"
+
+    def test_two_engine_configs_do_not_share_a_file_classification(self):
+        """One adapter serves every C# config, and the bounded pass can run them together."""
+        adapter = CSharpAdapter()
+        source = Path("/repo/Models/Animal.cs")
+        other_root = Path("/other")
+        adapter.record_document_symbols(
+            source, [{"name": "Animal", "kind": NodeType.CLASS}, {"name": "Dog", "kind": NodeType.CLASS}], self.root
+        )
+        adapter.record_document_symbols(source, [{"name": "Animal", "kind": NodeType.CLASS}], other_root)
+
+        assert adapter.build_qualified_name(source, "Animal", NodeType.CLASS, [], self.root) == "Models.Animal.Animal"
+
+    def test_a_file_never_seen_keeps_the_single_type_naming(self):
+        adapter = CSharpAdapter()
+        source = Path("/repo/Models/Animal.cs")
+
+        assert adapter.build_qualified_name(source, "Animal", NodeType.CLASS, [], self.root) == "Models.Animal"
+
+
+class TestExtractPackage:
+    """Tests for namespace/package extraction."""
+
+    def test_deep_qualified_name(self):
+        adapter = CSharpAdapter()
+        assert adapter.extract_package("Services.Auth.AuthService.Login") == "Services.Auth"
+
+    def test_shallow_qualified_name(self):
+        adapter = CSharpAdapter()
+        assert adapter.extract_package("Models.User") == "Models"
+
+    def test_single_component(self):
+        adapter = CSharpAdapter()
+        assert adapter.extract_package("Program") == "Program"
+
+
+class TestLspConfiguration:
+    """Tests for csharp-ls LSP configuration."""
+
+    def test_init_options_log_level(self):
+        adapter = CSharpAdapter()
+        opts = adapter.get_lsp_init_options()
+        assert opts["csharp"]["logLevel"] == "warning"
+
+    def test_workspace_settings(self):
+        adapter = CSharpAdapter()
+        settings = adapter.get_workspace_settings()
+        assert settings is not None
+        assert settings["csharp"]["logLevel"] == "warning"
+
+    def test_default_timeout_higher_than_base(self):
+        adapter = CSharpAdapter()
+        assert adapter.get_lsp_default_timeout() > 60
+
+    def test_probe_timeout_minimum_exceeds_default(self):
+        adapter = CSharpAdapter()
+        assert adapter.get_probe_timeout_minimum() > 300
+
+    def test_skips_initial_workspace_ready_wait(self):
+        # Why: csharp-ls does not consistently emit a startup workspace-ready
+        # signal for per-csproj launches. C# relies on the later probe and
+        # diagnostics waits instead.
+        adapter = CSharpAdapter()
+        assert adapter.wait_for_workspace_ready is False
+
+
+class TestLspEnv:
+    """Tests for DOTNET_ROOT and DOTNET_ROLL_FORWARD resolution."""
+
+    def test_skips_dotnet_root_when_already_set(self, monkeypatch):
+        monkeypatch.setenv("DOTNET_ROOT", "/usr/share/dotnet")
+        monkeypatch.delenv("DOTNET_ROLL_FORWARD", raising=False)
+        adapter = CSharpAdapter()
+        env = adapter.get_lsp_env()
+        assert "DOTNET_ROOT" not in env
+        assert env.get("DOTNET_ROLL_FORWARD") == "Major"
+
+    def test_resolves_dotnet_root_from_path(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("DOTNET_ROOT", raising=False)
+        monkeypatch.delenv("DOTNET_ROLL_FORWARD", raising=False)
+        # Simulate Homebrew layout: bin/dotnet -> Cellar/.../libexec/dotnet
+        libexec = tmp_path / "opt" / "dotnet" / "libexec"
+        libexec.mkdir(parents=True)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        dotnet_bin = bin_dir / "dotnet"
+        dotnet_bin.symlink_to(libexec / "dotnet")
+        (libexec / "dotnet").touch()
+        monkeypatch.setattr("shutil.which", lambda _: str(dotnet_bin))
+        adapter = CSharpAdapter()
+        env = adapter.get_lsp_env()
+        assert env.get("DOTNET_ROOT") == str(libexec)
+        assert env.get("DOTNET_ROLL_FORWARD") == "Major"
+
+    def test_skips_dotnet_root_when_dotnet_not_found(self, monkeypatch):
+        monkeypatch.delenv("DOTNET_ROOT", raising=False)
+        monkeypatch.delenv("DOTNET_ROLL_FORWARD", raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: None)
+        adapter = CSharpAdapter()
+        env = adapter.get_lsp_env()
+        assert "DOTNET_ROOT" not in env
+        assert env.get("DOTNET_ROLL_FORWARD") == "Major"
+
+    def test_sets_roll_forward_when_unset(self, monkeypatch):
+        # Why: csharp-ls is a dotnet tool, and older installs may pin a
+        # runtime not present on the host. Roll-forward keeps setup resilient
+        # across supported .NET SDK/runtime combinations.
+        monkeypatch.delenv("DOTNET_ROLL_FORWARD", raising=False)
+        monkeypatch.setenv("DOTNET_ROOT", "/usr/share/dotnet")
+        adapter = CSharpAdapter()
+        assert adapter.get_lsp_env()["DOTNET_ROLL_FORWARD"] == "Major"
+
+    def test_preserves_user_roll_forward(self, monkeypatch):
+        monkeypatch.setenv("DOTNET_ROLL_FORWARD", "LatestMajor")
+        monkeypatch.setenv("DOTNET_ROOT", "/usr/share/dotnet")
+        adapter = CSharpAdapter()
+        assert "DOTNET_ROLL_FORWARD" not in adapter.get_lsp_env()
+
+    def test_project_env_uses_resolved_sdk_and_single_target_override(self, monkeypatch, tmp_path):
+        for index in range(26):
+            (tmp_path / f"Project{index}.csproj").touch()
+        monkeypatch.setattr(
+            "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+            lambda _root: _dotnet_resolution("/private/dotnet", {"DOTNET_ROOT": "/private"}),
+        )
+        monkeypatch.setattr("static_analyzer.engine.adapters.csharp_adapter.get_servers_dir", lambda: tmp_path)
+        adapter = CSharpAdapter()
+        env = adapter.get_lsp_env(tmp_path)
+        targets_path = Path(env["DirectoryBuildTargetsPath"])
+
+        assert env["DOTNET_ROOT"] == "/private"
+        assert env["CodeBoardingFoldMultiTargetFrameworks"] == "true"
+        assert targets_path.is_file()
+        targets = targets_path.read_text()
+        assert "<TargetFrameworks>" in targets
+        assert "$(BundledNETCoreAppTargetFrameworkVersion)" in targets
+
+    def test_project_env_leaves_small_workspaces_multi_targeting(self, monkeypatch, tmp_path):
+        """Folding away frameworks costs a small solution coverage; demoting the property does not."""
+        (tmp_path / "Project.csproj").touch()
+        monkeypatch.setattr(
+            "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+            lambda _root: _dotnet_resolution("/private/dotnet", {"DOTNET_ROOT": "/private"}),
+        )
+        monkeypatch.setattr("static_analyzer.engine.adapters.csharp_adapter.get_servers_dir", lambda: tmp_path)
+
+        env = CSharpAdapter().get_lsp_env(tmp_path)
+
+        assert "CodeBoardingFoldMultiTargetFrameworks" not in env
+        assert Path(env["DirectoryBuildPropsPath"]).is_file()
+
+    def test_project_env_preserves_custom_directory_build_targets(self, monkeypatch, tmp_path):
+        for index in range(26):
+            (tmp_path / f"Project{index}.csproj").touch()
+        custom_targets = tmp_path / "custom.targets"
+        monkeypatch.setenv("DirectoryBuildTargetsPath", str(custom_targets))
+        monkeypatch.setattr(
+            "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+            lambda _root: _dotnet_resolution(),
+        )
+        monkeypatch.setattr("static_analyzer.engine.adapters.csharp_adapter.get_servers_dir", lambda: tmp_path)
+
+        env = CSharpAdapter().get_lsp_env(tmp_path)
+
+        assert env["CodeBoardingOriginalDirectoryBuildTargetsPath"] == str(custom_targets)
+        assert env["DirectoryBuildTargetsPath"] != str(custom_targets)
+
+    def test_project_env_demotes_workspace_target_framework(self, monkeypatch, tmp_path):
+        """A global TargetFramework silently rewrites projects that target something else."""
+        for index in range(26):
+            (tmp_path / f"Project{index}.csproj").touch()
+        monkeypatch.setattr(
+            "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+            lambda _root: _dotnet_resolution(),
+        )
+        monkeypatch.setattr("static_analyzer.engine.adapters.csharp_adapter.get_servers_dir", lambda: tmp_path)
+
+        env = CSharpAdapter().get_lsp_env(tmp_path)
+        props_path = Path(env["DirectoryBuildPropsPath"])
+
+        assert props_path.is_file()
+        props = props_path.read_text()
+        assert 'TreatAsLocalProperty="TargetFramework"' in props
+        assert (
+            "<CodeBoardingWorkspaceTargetFramework>$(TargetFramework)</CodeBoardingWorkspaceTargetFramework>" in props
+        )
+        # UseArtifactsOutput derives the artifacts root from this; the SDK skips it when
+        # DirectoryBuildPropsPath arrives from outside.
+        assert "<_DirectoryBuildPropsBasePath Condition=\"'$(_DirectoryBuildPropsBasePath)' == ''\">" in props
+        assert props.index("<_DirectoryBuildPropsBasePath") < props.index("<Import")
+        targets = Path(env["DirectoryBuildTargetsPath"]).read_text()
+        assert "<TargetFramework Condition=" not in targets
+        assert "<TargetFramework>$(TargetFrameworks)</TargetFramework>" not in targets
+
+    def test_project_env_preserves_custom_directory_build_props(self, monkeypatch, tmp_path):
+        for index in range(26):
+            (tmp_path / f"Project{index}.csproj").touch()
+        custom_props = tmp_path / "custom.props"
+        monkeypatch.setenv("DirectoryBuildPropsPath", str(custom_props))
+        monkeypatch.setattr(
+            "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+            lambda _root: _dotnet_resolution(),
+        )
+        monkeypatch.setattr("static_analyzer.engine.adapters.csharp_adapter.get_servers_dir", lambda: tmp_path)
+
+        env = CSharpAdapter().get_lsp_env(tmp_path)
+
+        assert env["CodeBoardingOriginalDirectoryBuildPropsPath"] == str(custom_props)
+        assert env["DirectoryBuildPropsPath"] != str(custom_props)
+
+
+class TestReferenceTracking:
+    """Tests for symbol filtering behavior."""
+
+    def test_namespace_is_reference_worthy(self):
+        adapter = CSharpAdapter()
+        assert adapter.is_reference_worthy(NodeType.NAMESPACE) is True
+
+    def test_class_is_reference_worthy(self):
+        adapter = CSharpAdapter()
+        assert adapter.is_reference_worthy(NodeType.CLASS) is True
+
+    def test_method_is_reference_worthy(self):
+        adapter = CSharpAdapter()
+        assert adapter.is_reference_worthy(NodeType.METHOD) is True
+
+
+class TestWaitForDiagnostics:
+    """csharp-ls publishes diagnostics asynchronously with no readiness signal,
+    so the adapter falls back to debouncing on the publishDiagnostics stream."""
+
+    def test_calls_quiesce_on_client(self):
+        adapter = CSharpAdapter()
+        called = {}
+
+        class FakeClient:
+            def wait_for_diagnostics_quiesce(self, idle_seconds, max_wait):
+                called["idle"] = idle_seconds
+                called["max"] = max_wait
+
+        adapter.wait_for_diagnostics(FakeClient())  # type: ignore[arg-type]
+        assert called.get("idle", 0) > 0, "csharp-ls needs an idle wait or diagnostics will be missed"
+        assert called.get("max", 0) >= called.get("idle", 0)
+
+
+class TestPrepareProject:
+    """``prepare_project`` runs ``dotnet restore`` so csharp-ls sees framework
+    references; without it diagnostics are flooded with bogus CS0518."""
+
+    @pytest.fixture(autouse=True)
+    def _fake_toolchain(self, tmp_path, monkeypatch):
+        self.commands: list[list[str]] = []
+        self.envs: list[dict[str, str]] = []
+        self.failing: set[str] = set()
+
+        def fake_run(cmd, **kwargs):
+            self.commands.append(cmd)
+            self.envs.append(kwargs.get("env", {}))
+            self.cwd = kwargs.get("cwd")
+            failed = cmd[2] in self.failing
+            return MagicMock(returncode=1 if failed else 0, stdout="", stderr="NETSDK1147 workload missing")
+
+        monkeypatch.setattr("static_analyzer.engine.adapters.csharp_adapter.subprocess.run", fake_run)
+        monkeypatch.setattr(
+            "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+            lambda _root: _dotnet_resolution("/opt/dotnet/dotnet", {"DOTNET_ROOT": "/opt/dotnet"}),
+        )
+        monkeypatch.setattr("static_analyzer.engine.adapters.csharp_adapter.get_servers_dir", lambda: tmp_path)
+
+    @staticmethod
+    def _project(root: Path, relative: str) -> None:
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_text("<Project />")
+
+    @staticmethod
+    def _analyzer_consumer(root: Path, relative: str, analyzer: str) -> None:
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        reference = os.path.relpath(root / analyzer, (root / relative).parent)
+        (root / relative).write_text(
+            "<Project><ItemGroup>"
+            f'<ProjectReference Include="{reference}" OutputItemType="Analyzer" />'
+            "</ItemGroup></Project>"
+        )
+
+    @staticmethod
+    def _solution(root: Path, name: str, *projects: str) -> None:
+        (root / name).write_text(
+            "<Solution>" + "".join(f'<Project Path="{project}" />' for project in projects) + "</Solution>"
+        )
+
+    def test_runs_dotnet_restore_when_csproj_present(self, tmp_path):
+        self._project(tmp_path, "Foo.csproj")
+
+        CSharpAdapter().prepare_project(tmp_path)
+
+        assert self.commands == [["/opt/dotnet/dotnet", "restore", "Foo.csproj", "--nologo", "--verbosity", "minimal"]]
+        assert self.cwd == str(tmp_path)
+        assert self.envs[0]["DOTNET_ROOT"] == "/opt/dotnet"
+
+    def test_restore_runs_under_the_environment_csharp_ls_gets(self, tmp_path):
+        """The two evaluate every path the same way, so the server finds what restore wrote."""
+        self._project(tmp_path, "Foo.csproj")
+
+        CSharpAdapter().prepare_project(tmp_path)
+
+        expected = CSharpAdapter().get_lsp_env(tmp_path)
+        assert {key: self.envs[0][key] for key in expected} == expected
+        assert Path(self.envs[0]["DirectoryBuildPropsPath"]).is_file()
+
+    def test_prefers_solution_over_csproj(self, tmp_path):
+        self._solution(tmp_path, "Foo.slnx", "Foo.csproj")
+        self._project(tmp_path, "Foo.csproj")
+
+        CSharpAdapter().prepare_project(tmp_path)
+
+        assert [cmd[2] for cmd in self.commands] == ["Foo.slnx"]
+
+    def test_skips_when_no_project_file(self, tmp_path, monkeypatch):
+        def fake_resolve(*_args, **_kwargs):
+            raise AssertionError("resolve_dotnet_sdk should not be called")
+
+        monkeypatch.setattr("static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk", fake_resolve)
+
+        CSharpAdapter().prepare_project(tmp_path)
+
+        assert self.commands == []
+
+    def test_raises_when_sdk_unavailable(self, tmp_path, monkeypatch):
+        self._project(tmp_path, "Foo.csproj")
+        monkeypatch.setattr(
+            "static_analyzer.engine.adapters.csharp_adapter.resolve_dotnet_sdk",
+            lambda _root: (_ for _ in ()).throw(DotnetSdkError("compatible .NET SDK was not found")),
+        )
+
+        with pytest.raises(RuntimeError, match="compatible .NET SDK"):
+            CSharpAdapter().prepare_project(tmp_path)
+        assert self.commands == []
+
+    def test_a_failed_project_restore_is_not_retried(self, tmp_path):
+        self._project(tmp_path, "Foo.csproj")
+        self.failing = {"Foo.csproj"}
+
+        CSharpAdapter().prepare_project(tmp_path)  # a warning, not an abort
+
+        assert [cmd[2] for cmd in self.commands] == ["Foo.csproj"]
+
+    def test_restores_each_member_when_the_solution_restore_fails(self, tmp_path):
+        """One project a solution restore cannot evaluate leaves every other project
+        without assets; the fallback restores the solution's members on their own,
+        and only them."""
+        self._solution(tmp_path, "App.slnx", "src/Lib/Lib.csproj", "src/Mobile/Mobile.csproj")
+        self._project(tmp_path, "src/Lib/Lib.csproj")
+        self._project(tmp_path, "src/Mobile/Mobile.csproj")
+        self._project(tmp_path, "samples/Demo/Demo.csproj")
+        self.failing = {"App.slnx", "src/Mobile/Mobile.csproj"}
+
+        CSharpAdapter().prepare_project(tmp_path)
+
+        assert [cmd[2] for cmd in self.commands] == ["App.slnx", "src/Lib/Lib.csproj", "src/Mobile/Mobile.csproj"]
+
+    def test_no_per_project_fallback_after_a_successful_solution_restore(self, tmp_path):
+        self._solution(tmp_path, "App.slnx", "Lib.csproj")
+        self._project(tmp_path, "Lib.csproj")
+
+        CSharpAdapter().prepare_project(tmp_path)
+
+        assert [cmd[2] for cmd in self.commands] == ["App.slnx"]
+
+    def test_builds_an_analyzer_project_after_a_solution_restore(self, tmp_path):
+        self._solution(tmp_path, "App.slnx", "App.csproj")
+        self._analyzer_consumer(tmp_path, "App.csproj", "src/Gen/Gen.csproj")
+        self._project(tmp_path, "src/Gen/Gen.csproj")
+
+        CSharpAdapter().prepare_project(tmp_path)
+
+        assert [cmd[1:3] for cmd in self.commands] == [["restore", "App.slnx"], ["build", "src/Gen/Gen.csproj"]]
+
+    def test_builds_an_analyzer_project_after_the_per_project_fallback(self, tmp_path):
+        self._solution(tmp_path, "App.slnx", "App.csproj")
+        self._analyzer_consumer(tmp_path, "App.csproj", "src/Gen/Gen.csproj")
+        self._project(tmp_path, "src/Gen/Gen.csproj")
+        self.failing = {"App.slnx"}
+
+        CSharpAdapter().prepare_project(tmp_path)
+
+        assert [cmd[1:3] for cmd in self.commands] == [
+            ["restore", "App.slnx"],
+            ["restore", "App.csproj"],
+            ["build", "src/Gen/Gen.csproj"],
+        ]
+
+    def test_builds_an_analyzer_project_for_a_bare_project_target(self, tmp_path):
+        self._analyzer_consumer(tmp_path, "App.csproj", "src/Gen/Gen.csproj")
+        self._project(tmp_path, "src/Gen/Gen.csproj")
+
+        CSharpAdapter().prepare_project(tmp_path)
+
+        assert [cmd[1:3] for cmd in self.commands] == [["restore", "App.csproj"], ["build", "src/Gen/Gen.csproj"]]
+
+    def test_builds_the_analyzer_even_when_restore_failed(self, tmp_path):
+        """``dotnet build`` restores the analyzer itself, and a failed restore is exactly
+        when the reference is most likely to be unresolved."""
+        self._analyzer_consumer(tmp_path, "App.csproj", "src/Gen/Gen.csproj")
+        self._project(tmp_path, "src/Gen/Gen.csproj")
+        self.failing = {"App.csproj"}
+
+        CSharpAdapter().prepare_project(tmp_path)
+
+        assert [cmd[1:3] for cmd in self.commands] == [["restore", "App.csproj"], ["build", "src/Gen/Gen.csproj"]]
+
+    def test_builds_nothing_when_no_analyzer_reference_exists(self, tmp_path):
+        self._project(tmp_path, "App.csproj")
+
+        CSharpAdapter().prepare_project(tmp_path)
+
+        assert [cmd[1] for cmd in self.commands] == ["restore"]
+
+    def test_warns_when_an_analyzer_project_fails_to_build(self, tmp_path, caplog):
+        """The injected target then drops it, so the run continues without that
+        generator's symbols -- which must not pass silently."""
+        self._analyzer_consumer(tmp_path, "App.csproj", "src/Gen/Gen.csproj")
+        self._project(tmp_path, "src/Gen/Gen.csproj")
+        self.failing = {"src/Gen/Gen.csproj"}
+
+        with caplog.at_level(logging.WARNING):
+            CSharpAdapter().prepare_project(tmp_path)
+
+        assert "only 0 of 1 built" in caplog.text
+
+    def test_handles_subprocess_timeout(self, tmp_path, monkeypatch):
+        self._project(tmp_path, "Foo.csproj")
+
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+
+        monkeypatch.setattr("static_analyzer.engine.adapters.csharp_adapter.subprocess.run", fake_run)
+
+        CSharpAdapter().prepare_project(tmp_path)  # no exception
+
+
+class TestReadDocumentSymbols:
+    """The parse tree stands in only for a file the loaded solution declares types in (a
+    source compiled into several projects); a file the server does not know is left to it."""
+
+    def _client(self, hits: list[str]) -> MagicMock:
+        client = MagicMock()
+        client.workspace_symbol.return_value = [{"name": "Clock", "location": {"uri": uri}} for uri in hits]
+        return client
+
+    def test_a_file_the_solution_declares_is_read_from_source(self, tmp_path: Path):
+        shared = tmp_path / "Shared" / "Clock.cs"
+        shared.parent.mkdir()
+        shared.write_text('namespace Shared;\ninternal static class Clock { public static string Stamp() => ""; }\n')
+        client = self._client([shared.resolve().as_uri()])
+
+        symbols = CSharpAdapter().read_document_symbols(shared, SourceInspector(), client)
+
+        assert [child["name"] for child in symbols[0]["children"][0]["children"]] == ["Clock"]
+        client.workspace_symbol.assert_called_once_with("Clock")
+
+    def test_a_file_the_solution_does_not_declare_is_left_to_the_server(self, tmp_path: Path):
+        loose = tmp_path / "Loose.cs"
+        loose.write_text("class Clock { }\n")
+        client = self._client([(tmp_path / "Elsewhere" / "Clock.cs").as_uri()])
+
+        assert CSharpAdapter().read_document_symbols(loose, SourceInspector(), client) == []
+
+    def test_a_file_without_types_asks_nothing(self, tmp_path: Path):
+        usings = tmp_path / "GlobalUsings.cs"
+        usings.write_text("global using System;\n")
+        client = self._client([])
+
+        assert CSharpAdapter().read_document_symbols(usings, SourceInspector(), client) == []
+        client.workspace_symbol.assert_not_called()

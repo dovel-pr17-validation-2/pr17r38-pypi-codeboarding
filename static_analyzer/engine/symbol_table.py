@@ -1,0 +1,403 @@
+"""Symbol storage, registration, and lookup for LSP-based analysis."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Collection, Iterable
+from pathlib import Path
+
+from static_analyzer.engine.protocols import SymbolNaming
+from static_analyzer.config import ANONYMOUS_SYMBOL_MARKERS, NodeType
+from static_analyzer.engine.lsp_constants import CALLABLE_KINDS
+from static_analyzer.engine.models import SymbolInfo
+
+logger = logging.getLogger(__name__)
+
+# Kinds a server files a named value under, which a function literal can be the value of.
+_VALUE_KINDS = frozenset({NodeType.VARIABLE, NodeType.CONSTANT, NodeType.PROPERTY, NodeType.FIELD})
+
+
+class SymbolTable:
+    """Manages symbol discovery, registration, and lookup.
+
+    Owns all symbol dictionaries and provides methods for querying
+    symbols by name, position, or qualified name.
+    """
+
+    def __init__(self, naming: SymbolNaming) -> None:
+        self._naming = naming
+
+        # Symbol table: qualified_name -> SymbolInfo
+        self._symbols: dict[str, SymbolInfo] = {}
+        # File -> list of ALL symbols in that file (including aliases)
+        self._file_symbols: dict[str, list[SymbolInfo]] = {}
+        # File -> list of PRIMARY symbols only (no aliases, for containment/lift)
+        self._primary_file_symbols: dict[str, list[SymbolInfo]] = {}
+        # Reference key (lowercase) -> symbol info
+        self._ref_key_to_symbol: dict[str, SymbolInfo] = {}
+
+        # --- Lookup indices built after registration ---
+        # (file_key, name) -> list of symbols with that name in that file
+        self._file_name_index: dict[tuple[str, str], list[SymbolInfo]] = {}
+        # class qualified_name -> list of constructor qualified_names
+        self._class_to_ctors: dict[str, list[str]] = {}
+        # Declarations of files this build does not read: resolvable, never output.
+        self._known: list[SymbolInfo] = []
+
+    @property
+    def symbols(self) -> dict[str, SymbolInfo]:
+        """Public read-only access to the symbol table."""
+        return self._symbols
+
+    @property
+    def primary_file_symbols(self) -> dict[str, list[SymbolInfo]]:
+        """Primary symbols per file (no dual-registration aliases)."""
+        return self._primary_file_symbols
+
+    @property
+    def file_symbols(self) -> dict[str, list[SymbolInfo]]:
+        """All symbols per file (including aliases)."""
+        return self._file_symbols
+
+    @property
+    def class_to_ctors(self) -> dict[str, list[str]]:
+        """Class qualified name -> list of constructor qualified names."""
+        return self._class_to_ctors
+
+    @property
+    def known(self) -> list[SymbolInfo]:
+        """Declarations registered for lookup only, from files this build does not read."""
+        return self._known
+
+    def register_known(self, declarations: Iterable[SymbolInfo]) -> None:
+        """Make *declarations* resolvable without making them this build's own.
+
+        Why: a warm start reads only the changed files, and a call from one into an unchanged file
+        must resolve the way a full build resolves it. They stay out of the primary symbols, so
+        references and hierarchies are still built from the files read.
+        """
+        for sym in declarations:
+            existing = self._symbols.get(sym.qualified_name)
+            if existing is not None and existing.is_definition:
+                continue
+            self._symbols[sym.qualified_name] = sym
+            self._ref_key_to_symbol[self._naming.build_reference_key(sym.qualified_name)] = sym
+            self._file_symbols.setdefault(str(sym.file_path), []).append(sym)
+            self._known.append(sym)
+
+    def register_symbols(
+        self,
+        file_path: Path,
+        symbols: list[dict],
+        parent_chain: list[tuple[str, int]],
+        project_root: Path,
+        owner_qualified_name: str = "",
+        function_values: Collection[tuple[int, int]] = (),
+    ) -> None:
+        """Recursively register symbols with dual registration.
+
+        *function_values* are the positions of the names the file binds to a function literal.
+        """
+        for sym in symbols:
+            name = sym.get("name", "")
+            kind = sym.get("kind", 0)
+            detail = sym.get("detail", "")
+
+            if not name:
+                continue
+
+            # Promote variables/constants with method children to class
+            children = sym.get("children", [])
+            promoted = False
+            if kind in (NodeType.VARIABLE, NodeType.CONSTANT) and children:
+                child_kinds = {c.get("kind", 0) for c in children}
+                if child_kinds & CALLABLE_KINDS:
+                    kind = NodeType.CLASS
+                    promoted = True
+
+            range_info = sym.get("range", sym.get("location", {}).get("range", {}))
+            sel_range = sym.get("selectionRange", range_info)
+
+            start = range_info.get("start", {})
+            end = range_info.get("end", {})
+            sel_start = sel_range.get("start", start)
+
+            start_line = sel_start.get("line", 0)
+            start_char = sel_start.get("character", 0)
+            end_line = end.get("line", 0)
+            end_char = end.get("character", 0)
+
+            # A class member bound to a function literal -- ``onMove = (e) => ...`` -- is a method,
+            # whichever kind the server files it under.
+            if (
+                kind in _VALUE_KINDS
+                and parent_chain
+                and self._naming.is_class_like(parent_chain[-1][1])
+                and (start_line, start_char) in function_values
+            ):
+                kind = NodeType.METHOD
+
+            # csharp-ls files an enum's members as fields; the parse-tree fallback names them members.
+            if (
+                kind == NodeType.FIELD
+                and parent_chain
+                and parent_chain[-1][1] == NodeType.ENUM
+                and self._naming.reports_enum_members_as_fields
+            ):
+                kind = NodeType.ENUM_MEMBER
+
+            file_key = str(file_path)
+
+            qualified_name = sym.get("qualified_name") or self._naming.build_qualified_name(
+                file_path, name, kind, parent_chain, project_root, detail
+            )
+
+            info = SymbolInfo(
+                name=name,
+                qualified_name=qualified_name,
+                kind=kind,
+                file_path=file_path,
+                start_line=start_line,
+                start_char=start_char,
+                end_line=end_line,
+                end_char=end_char,
+                promoted_from_variable=promoted,
+            )
+            info.parent_chain = list(parent_chain)
+            info.owner_qualified_name = owner_qualified_name
+            info.explicit_identity = bool(sym.get("qualified_name"))
+            info.is_definition = sym.get("is_definition", True)
+
+            if info.is_definition or qualified_name not in self._symbols:
+                self._symbols[qualified_name] = info
+                ref_key = self._naming.build_reference_key(qualified_name)
+                self._ref_key_to_symbol[ref_key] = info
+            self._file_symbols.setdefault(file_key, []).append(info)
+            self._primary_file_symbols.setdefault(file_key, []).append(info)
+
+            # Dual registration: the unqualified form, then each partial parent chain.
+            # Aliases go into _file_symbols but NOT _primary_file_symbols
+            if parent_chain and not sym.get("qualified_name"):
+                chains: list[list[tuple[str, int]]] = [[]] + [
+                    parent_chain[skip:] for skip in range(1, len(parent_chain))
+                ]
+                for chain in chains:
+                    alias = self._naming.build_qualified_name(file_path, name, kind, chain, project_root, detail)
+                    self._register_alias(alias, info, chain)
+
+            if children:
+                child_chain = parent_chain + [(name, kind)]
+                self.register_symbols(file_path, children, child_chain, project_root, qualified_name, function_values)
+
+    def build_indices(self) -> None:
+        """Build optimized lookup indices after symbol registration.
+
+        Called once after all symbols are registered. Provides O(1)
+        name-based equivalent lookups and class-to-constructor mappings.
+        """
+        # Build (file, name) -> symbols index for equivalent name lookup
+        for file_key, syms in self._file_symbols.items():
+            for sym in syms:
+                idx_key = (file_key, sym.name)
+                self._file_name_index.setdefault(idx_key, []).append(sym)
+
+        # Class -> constructors, keyed on the declaring symbol.
+        # Why not a slice at the first "(": that names the class only where the scheme
+        # doubles it, and it cannot tell a primary symbol from an alias.
+        for sym in [*(s for syms in self._primary_file_symbols.values() for s in syms), *self._known]:
+            owner = self._symbols.get(sym.owner_qualified_name)
+            if owner is not None and self._naming.is_class_like(owner.kind):
+                # Out-of-line definitions inherit the owning class from their declarations.
+                self._symbols[sym.qualified_name].owner_qualified_name = owner.qualified_name
+            if sym.kind == NodeType.CONSTRUCTOR and sym.owner_qualified_name:
+                self._class_to_ctors.setdefault(sym.owner_qualified_name, []).append(sym.qualified_name)
+
+    def find_containing_symbol(self, file_path: Path, line: int, character: int) -> SymbolInfo | None:
+        """The innermost symbol whose range contains the given position."""
+        file_key = str(file_path)
+        symbols = self._file_symbols.get(file_key, [])
+
+        best: SymbolInfo | None = None
+        best_size = float("inf")
+
+        for sym in symbols:
+            if sym.start_line <= line <= sym.end_line:
+                if sym.start_line == line and character < sym.start_char:
+                    continue
+                if sym.end_line == line and character > sym.end_char:
+                    continue
+                size = (sym.end_line - sym.start_line) * 10000 + (sym.end_char - sym.start_char)
+                if size < best_size or (
+                    size == best_size and best is not None and len(sym.qualified_name) > len(best.qualified_name)
+                ):
+                    best = sym
+                    best_size = size
+
+        return best
+
+    def lift_to_callable(self, sym: SymbolInfo) -> SymbolInfo | None:
+        """If sym is a variable/property, find its parent callable symbol."""
+        if self._naming.is_callable(sym.kind) or self._naming.is_class_like(sym.kind):
+            return sym
+
+        file_key = str(sym.file_path)
+        candidates = self._file_symbols.get(file_key, [])
+
+        best: SymbolInfo | None = None
+        best_size = float("inf")
+
+        for other in candidates:
+            if other.qualified_name == sym.qualified_name:
+                continue
+            if not (self._naming.is_callable(other.kind) or self._naming.is_class_like(other.kind)):
+                continue
+            if other.start_line <= sym.start_line and other.end_line >= sym.end_line:
+                size = (other.end_line - other.start_line) * 10000 + (other.end_char - other.start_char)
+                if size < best_size:
+                    best = other
+                    best_size = size
+
+        return best or sym
+
+    def attribution_symbol(self, sym: SymbolInfo) -> SymbolInfo:
+        """The innermost enclosing declaration a reader would name, or ``sym`` itself.
+
+        Why credit only: the guards need the innermost symbol, widening it there drops call sites.
+        """
+        if not self._is_unnameable(sym):
+            return sym
+
+        best: SymbolInfo | None = None
+        best_size = float("inf")
+        # A promoted `const x = ...` wrapper is a name a reader recognises, unlike an anonymous
+        # callback, so it is a usable credit — but only when nothing named encloses it. Module
+        # level is exactly that case: there is no function above it to prefer.
+        fallback: SymbolInfo | None = None
+        fallback_size = float("inf")
+        for other in self._file_symbols.get(str(sym.file_path), []):
+            if other.qualified_name == sym.qualified_name or self._is_anonymous(other):
+                continue
+            if not (self._naming.is_callable(other.kind) or self._naming.is_class_like(other.kind)):
+                continue
+            if not self._encloses(other, sym):
+                continue
+            size = (other.end_line - other.start_line) * 10000 + (other.end_char - other.start_char)
+            if other.promoted_from_variable:
+                if size < fallback_size:
+                    fallback = other
+                    fallback_size = size
+            elif size < best_size:
+                best = other
+                best_size = size
+        return best or fallback or sym
+
+    def get_equivalent_names(self, qualified_name: str) -> list[str]:
+        """Get equivalent symbol names for edge expansion using pre-built index."""
+        sym = self._symbols.get(qualified_name)
+        if sym is None:
+            return []
+
+        file_key = str(sym.file_path)
+        idx_key = (file_key, sym.name)
+        same_name_syms = self._file_name_index.get(idx_key, [])
+
+        return [s.qualified_name for s in same_name_syms if s.qualified_name != qualified_name]
+
+    def get_canonical_name(self, qualified_name: str) -> str:
+        """Return the canonical (shortest) qualified name for a symbol.
+
+        Dual registration creates multiple qualified names for the same symbol
+        at the same position (e.g. ``Module.Class.method`` and ``Module.method``).
+        To avoid edge duplication, we pick the **shortest** form so that every
+        equivalent alias maps to the same canonical edge.
+        """
+        sym = self._symbols.get(qualified_name)
+        if sym is None:
+            return qualified_name
+        equivalents = self.get_equivalent_names(qualified_name)
+        if not equivalents:
+            return qualified_name
+        all_names = [qualified_name] + equivalents
+        return min(all_names, key=len)
+
+    def is_local_variable(self, sym: SymbolInfo) -> bool:
+        """Check whether a symbol is a local/parameter that should be excluded.
+
+        Excludes:
+        - Variables/constants with any parent (parameters, locals, attributes)
+        - Properties inside callables (e.g. destructured return values,
+          object literal properties in TypeScript/JavaScript functions)
+
+        Module-level variables (handler functions, constants used as callbacks)
+        and class-level properties/fields are kept.
+
+        Also catches unqualified aliases (dual registration) by checking if
+        any symbol at the same position has a parent.
+        """
+        if sym.kind in (NodeType.VARIABLE, NodeType.CONSTANT):
+            if sym.parent_chain:
+                return True
+            # Check if any co-located symbol (alias at same position) has a parent
+            pos_key = sym.definition_location
+            file_key = str(sym.file_path)
+            for other in self._file_symbols.get(file_key, []):
+                if other.definition_location == pos_key and other.parent_chain:
+                    return True
+            return False
+
+        if sym.kind == NodeType.PROPERTY and sym.parent_chain:
+            # Properties inside callables are local (e.g. destructured values);
+            # properties whose immediate parent is a class are class members — keep those.
+            parent_kind = sym.parent_chain[-1][1] if sym.parent_chain else 0
+            if self._naming.is_callable(parent_kind):
+                return True
+
+        return False
+
+    def _register_alias(self, alias_name: str, primary: SymbolInfo, chain: list[tuple[str, int]]) -> None:
+        """Register *alias_name* for *primary*, unless a declaration registered first already holds the name.
+
+        Why the first keeps it: a name registered twice -- a Rust type's trait impls each declaring
+        ``fmt``, a hook's local and the property returning it -- is two declarations, and the alias is
+        what keeps the first one reachable once the second takes the qualified name.
+        """
+        if alias_name == primary.qualified_name or alias_name in self._symbols:
+            return
+        alias = SymbolInfo(
+            name=primary.name,
+            qualified_name=alias_name,
+            kind=primary.kind,
+            file_path=primary.file_path,
+            start_line=primary.start_line,
+            start_char=primary.start_char,
+            end_line=primary.end_line,
+            end_char=primary.end_char,
+            parent_chain=list(chain),
+            promoted_from_variable=primary.promoted_from_variable,
+        )
+        self._symbols[alias_name] = alias
+        self._ref_key_to_symbol[self._naming.build_reference_key(alias_name)] = alias
+        self._file_symbols[str(primary.file_path)].append(alias)
+
+    def _is_unnameable(self, sym: SymbolInfo) -> bool:
+        """Whether this symbol's own name is not one a reader would use as a caller."""
+        return sym.promoted_from_variable or self._is_anonymous(sym)
+
+    @staticmethod
+    def _is_anonymous(sym: SymbolInfo) -> bool:
+        return any(marker in sym.name for marker in ANONYMOUS_SYMBOL_MARKERS)
+
+    @staticmethod
+    def _encloses(outer: SymbolInfo, inner: SymbolInfo) -> bool:
+        """Whether *outer*'s range fully contains *inner*'s, character bounds included.
+
+        Why characters: several declarations can share a line, and comparing lines alone lets
+        an unrelated neighbour win.
+        """
+        if outer.start_line > inner.start_line or outer.end_line < inner.end_line:
+            return False
+        if outer.start_line == inner.start_line and outer.start_char > inner.start_char:
+            return False
+        if outer.end_line == inner.end_line and outer.end_char < inner.end_char:
+            return False
+        return True

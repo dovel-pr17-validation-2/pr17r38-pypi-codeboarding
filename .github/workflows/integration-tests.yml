@@ -1,0 +1,232 @@
+name: Integration Tests
+
+# The integration suite lives in a private repository. This workflow dispatches
+# it and mirrors the result; it never downloads the tests, and it prints no test
+# output, so nothing about the suite reaches this repo's public logs.
+#
+on:
+  workflow_dispatch:
+    inputs:
+      language:
+        description: 'Language to test (leave empty for all)'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - python
+          - java
+          - kotlin
+          - go
+          - typescript
+          - php
+          - javascript
+          - rust
+          - csharp
+          - cpp
+          - cuda
+      full_matrix:
+        description: 'Run all 3 OSes instead of the smoke subset'
+        required: false
+        default: false
+        type: boolean
+
+  # PRs are intentionally not executed, but kept for manual visibility + optional
+  # skip behavior when the listed files are touched. The exception is a kotlin-lsp
+  # bump: its Kotlin leg is the evidence for merging it. That has to be a pull_request
+  # run, because GitHub leaves workflow_dispatch runs out of a pull request's checks.
+  pull_request:
+    paths:
+      - 'infra/install.py'
+      - 'infra/tool_registry/**'
+      - 'infra/vscode_constants.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'static_analyzer/**'
+      - 'infra/repo_utils/ignore.py'
+      - 'agents/model_capabilities.py'
+      - 'agents/llm_config.py'
+      - 'health/**'
+      - 'tests/infra/test_install.py'
+      - 'tests/infra/test_tool_registry.py'
+      - '.github/workflows/integration-tests.yml'
+
+  # A completed sync pushes this generated baseline commit. Trigger from that
+  # commit so the CodeBoarding-tests check is attached to the sync result.
+  push:
+    branches: ['main']
+    paths:
+      - '.codeboarding/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  private-suite:
+    name: CodeBoarding-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    # Manual runs are always available. PR runs are intentionally skipped, except
+    # kotlin-lsp bumps. Other automatic execution is limited to the baseline commit
+    # pushed by sync.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       github.event.head_commit.message == 'chore(codeboarding): sync architecture baseline') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       startsWith(github.head_ref, 'kotlin-server/'))
+    steps:
+      # Mint a short-lived installation token instead of carrying a PAT. It is
+      # narrowed to the tests repo and to Actions - it cannot clone the suite
+      # (no `contents`) or touch any other org repo. `actions: write` does
+      # include read, though, so within its ~1h life it can download the private
+      # run's logs and artifacts (test output, fixture values). That is tolerable
+      # only while push access to this repo stays a subset of CodeBoarding-tests
+      # access: a same-repo PR runs this workflow's PR-modified copy *with*
+      # secrets, so a PR author could rewrite the steps below to read those logs,
+      # but anyone who could do that can already clone the tests repo directly.
+      # If the collaborator sets ever diverge, move minting + dispatch into a
+      # workflow_run job that runs the base-branch copy, out of PR control.
+      #
+      # Two mint steps mirror codeboarding-sync's credential handling so the gate
+      # cannot break silently on a config the sync workflow accepts. A client id
+      # (prefix "Iv") may be stored in CODEBOARDING_APP_ID rather than
+      # CODEBOARDING_APP_CLIENT_ID; like sync, an Iv-prefixed app-id value is
+      # routed to client-id rather than passed to the app-id input, which would
+      # otherwise reject it.
+      - name: Mint a token for the private repo (client id)
+        id: token-client-id
+        if: ${{ vars.CODEBOARDING_APP_CLIENT_ID != '' || startsWith(vars.CODEBOARDING_APP_ID, 'Iv') }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.CODEBOARDING_APP_CLIENT_ID != '' && vars.CODEBOARDING_APP_CLIENT_ID || vars.CODEBOARDING_APP_ID }}
+          private-key: ${{ secrets.CODEBOARDING_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: CodeBoarding-tests
+          permission-actions: write
+
+      - name: Mint a token for the private repo (app id)
+        id: token-app-id
+        if: ${{ vars.CODEBOARDING_APP_CLIENT_ID == '' && vars.CODEBOARDING_APP_ID != '' && !startsWith(vars.CODEBOARDING_APP_ID, 'Iv') }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.CODEBOARDING_APP_ID }}
+          private-key: ${{ secrets.CODEBOARDING_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: CodeBoarding-tests
+          permission-actions: write
+
+      - name: Dispatch and await the private suite
+        env:
+          GH_TOKEN: ${{ steps.token-client-id.outputs.token || steps.token-app-id.outputs.token }}
+          PRIVATE_REPO: CodeBoarding/CodeBoarding-tests
+          WORKFLOW: run-integration-tests.yml
+          TESTS_REF: main
+          # github.sha is the commit hash for the triggering event:
+          # the sync-pushed head commit on main, or the current commit for
+          # manual workflow_dispatch runs. On a pull request it is a merge
+          # commit, so that case names the branch's own head.
+          ENGINE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          LANGUAGE: ${{ github.event.inputs.language || (github.event_name == 'pull_request' && 'kotlin') || '' }}
+          FULL_MATRIX: ${{ github.event.inputs.full_matrix }}
+        run: |
+          set -euo pipefail
+
+          # `set -u` will not catch this: an unavailable token expands to the
+          # empty string, and gh would fail later with an opaque 404. Fail closed
+          # - an unverifiable suite must never read as a passing one.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::Could not mint a CodeBoarding App token. Check CODEBOARDING_APP_CLIENT_ID (or CODEBOARDING_APP_ID) and CODEBOARDING_APP_PRIVATE_KEY. See CONTRIBUTING.md."
+            exit 1
+          fi
+
+          # Tag the run so we can find the one *we* started. Timestamps alone
+          # race: two PRs dispatching at once would each adopt the newer run.
+          dispatch_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          # --ref is required, not cosmetic: without it gh resolves the default
+          # branch via GraphQL, which needs `contents: read` - the one permission
+          # we withhold so a leaked token cannot download the suite.
+          args=(-f "engine_ref=$ENGINE_SHA" -f "dispatch_id=$dispatch_id")
+          # Only forward `language` when set, so the receiving workflow applies
+          # its own default (all languages) rather than an empty choice value.
+          [ -n "$LANGUAGE" ] && args+=(-f "language=$LANGUAGE")
+          [ "$FULL_MATRIX" = "true" ] && args+=(-f "full_matrix=true")
+          gh workflow run "$WORKFLOW" --repo "$PRIVATE_REPO" --ref "$TESTS_REF" "${args[@]}"
+
+          # `gh workflow run` returns no run id, so poll for the run whose
+          # run-name carries our dispatch id.
+          run_id=""
+          for _ in $(seq 1 24); do
+            sleep 5
+            # Match either field: GitHub surfaces an evaluated run-name as
+            # `name`, and depending on event also as `displayTitle`.
+            run_id=$(gh run list --repo "$PRIVATE_REPO" --workflow "$WORKFLOW" \
+              --event workflow_dispatch --limit 30 \
+              --json databaseId,name,displayTitle \
+              -q "[.[] | select(((.name // \"\") + \" \" + (.displayTitle // \"\")) | contains(\"[$dispatch_id]\"))] | first | .databaseId" \
+              2>/dev/null || true)
+            [ -n "$run_id" ] && [ "$run_id" != "null" ] && break
+          done
+
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "::error::Dispatched the private suite but could not find its run."
+            exit 1
+          fi
+
+          run_url="https://github.com/$PRIVATE_REPO/actions/runs/$run_id"
+          echo "Private integration run: $run_url"
+          echo "Waiting for it to finish. Logs stay in the private repo."
+
+          # Poll rather than `gh run watch`: watch cannot authenticate with an
+          # App/fine-grained token (it needs checks:read, which they cannot
+          # grant), and its exit code conflates "suite failed" with "gh failed".
+          # The run's own conclusion is the only trustworthy signal.
+          #
+          # The minted App token expires ~1h in, so cap polling below that (110 x
+          # 30s = 55m) and treat a run of gh failures as lost contact rather than
+          # as "still running" - otherwise an expired token silently turns a
+          # green run into a false timeout. Full-matrix runs that need longer
+          # should be launched from the private repo directly.
+          conclusion=""
+          fail_streak=0
+          for _ in $(seq 1 110); do
+            if result=$(gh run view "$run_id" --repo "$PRIVATE_REPO" \
+                  --json status,conclusion -q '"\(.status)|\(.conclusion // "")"' 2>/dev/null); then
+              fail_streak=0
+              if [ "${result%%|*}" = "completed" ]; then
+                conclusion="${result#*|}"
+                break
+              fi
+            else
+              fail_streak=$((fail_streak + 1))
+              if [ "$fail_streak" -ge 3 ]; then
+                echo "::error::Lost contact with the private run after repeated API errors (the dispatch token expires ~1h in). It may still be running: $run_url"
+                exit 1
+              fi
+            fi
+            sleep 30
+          done
+
+          {
+            echo "### Private integration tests: \`${conclusion:-unknown}\`"
+            echo ""
+            echo "Engine commit: \`$ENGINE_SHA\`"
+            echo ""
+            echo "Full output is in the private repo (maintainers only): [run $run_id]($run_url)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$conclusion" ]; then
+            echo "::error::Private run still unfinished after ~55m of polling. It may still be going. See $run_url"
+            exit 1
+          fi
+
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::Private integration tests concluded '$conclusion'. See $run_url"
+            exit 1
+          fi

@@ -1,0 +1,106 @@
+import argparse
+import json
+import logging
+import sys
+from typing import Any
+
+from agents.llm_config import LLMConfigError
+from agents.llm_errors import LLMAuthError, LLMQuotaError
+from diagram_analysis.exceptions import ScopeSemanticsError
+from codeboarding_cli.bootstrap import bootstrap_environment, resolve_local_run_paths
+from codeboarding_cli.view_instructions import print_view_instructions
+from codeboarding_workflows.analysis import BaselineUnavailableError, EngineChangedError, run_full, run_incremental
+from diagram_analysis import RunContext
+from diagram_analysis.run_mode import RunMode
+from infra.utils import monitoring_enabled
+
+logger = logging.getLogger(__name__)
+
+
+def add_arguments(subparsers: argparse._SubParsersAction, parents: list[argparse.ArgumentParser]) -> None:
+    subparsers.add_parser(
+        "incremental",
+        parents=parents,
+        help="Update an existing analysis for what changed since it was generated (no git needed).",
+    )
+
+
+def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.local is None:
+        parser.error("incremental requires --local")
+
+
+def run_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    validate_arguments(args, parser)
+
+    run_paths = resolve_local_run_paths(args)
+    run_paths.output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        bootstrap_environment(run_paths.output_dir, args.binary_location)
+    except LLMConfigError as exc:
+        logger.warning("Incremental bootstrap failed: LLM provider not configured: %s", exc)
+        _emit({"mode": RunMode.INCREMENTAL, "error": str(exc), "kind": "api_key_missing"})
+        return
+    except ValueError as exc:
+        logger.exception("Incremental bootstrap failed")
+        _emit_error(str(exc))
+        return
+
+    run_context = RunContext.resolve(project_name=run_paths.project_name)
+    should_monitor = args.enable_monitoring or monitoring_enabled()
+    mode = RunMode.INCREMENTAL
+
+    try:
+        analysis_path = run_incremental(run_paths, run_context, monitoring_enabled=should_monitor)
+    except EngineChangedError as exc:
+        # Why: an engine release reaches CI unasked, and nobody is there to answer a prompt.
+        logger.warning("%s Running a full analysis instead.", exc)
+        mode = RunMode.FULL
+        analysis_path = run_full(
+            run_paths,
+            run_context,
+            depth_cap=exc.depth_cap,
+            monitoring_enabled=should_monitor,
+            force_full=True,
+        )
+    except BaselineUnavailableError as exc:
+        # Expected: no baseline, or diff failed against the requested base ref.
+        # The wire contract's ``requiresFullAnalysis: true`` tells the wrapper
+        # to prompt for a full run; no stack trace needed.
+        logger.info("Incremental unavailable: %s", exc)
+        _emit_error(str(exc))
+        return
+    except (LLMAuthError, LLMQuotaError, ScopeSemanticsError):
+        # A full run would fail the same way, so don't ask for one.
+        raise
+    except Exception as exc:
+        logger.exception("Incremental analysis failed")
+        _emit_error(str(exc))
+        return
+
+    _emit(
+        {
+            "mode": mode,
+            "requiresFullAnalysis": False,
+            "analysis_path": str(analysis_path),
+        }
+    )
+    # Human-facing hint (logs to stderr, so the stdout JSON contract stays clean).
+    print_view_instructions(analysis_path)
+
+
+def _emit_error(message: str) -> None:
+    _emit(
+        {
+            "mode": RunMode.INCREMENTAL,
+            "error": message,
+            "requiresFullAnalysis": True,
+        }
+    )
+
+
+def _emit(payload: dict[str, Any]) -> None:
+    """Write a wire dict as JSON to stdout (the IDE/wrapper contract)."""
+    sys.stdout.write(json.dumps(payload, default=str, indent=2, sort_keys=True) + "\n")
+    sys.stdout.flush()

@@ -1,0 +1,45 @@
+name: CodeBoarding review
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, closed, synchronize]
+  issue_comment:
+    types: [created]
+
+# No workflow-level permissions: each job requests only what it needs (least
+# privilege), so the default token starts with none.
+permissions: {}
+
+concurrency:
+  group: codeboarding-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' }}
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read        # check out the repo + read the committed baseline (no writes in review mode)
+      actions: read         # download the analysis an earlier run published, instead of re-deriving this PR every push
+      pull-requests: write  # post the architecture-diff PR comment
+      issues: write         # the /codeboarding issue_comment trigger + comment API
+      id-token: write       # mint a GitHub OIDC token; both hosted tiers, free and licensed, need it
+    if: >
+      (github.event_name == 'pull_request' && github.event.action != 'closed' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null &&
+       startsWith(github.event.comment.body, '/codeboarding') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    steps:
+      - uses: CodeBoarding/CodeBoarding-action@v1
+        with:
+          # Cap review analysis at depth 4, including baseline bootstrapping.
+          # Requires the licensed tier (the free tier caps depth at 3).
+          depth_cap: 4
+          # Named, not inferred: the action requires `llm` and fails rather than falling
+          # back to anything. CodeBoarding's own repositories run on the CodeBoarding
+          # plan, which is also what lifts the free tier's depth cap off `depth_cap: 4`.
+          # Both secrets used to be wired here at once and OPENROUTER_API_KEY silently
+          # won, so the plan was never actually spent; this is the deliberate choice.
+          llm: license
+          license_key: ${{ secrets.CODEBOARDING_LICENSE }}

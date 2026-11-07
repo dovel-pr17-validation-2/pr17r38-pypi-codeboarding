@@ -1,0 +1,68 @@
+"""Protocols for engine components — breaks circular dependencies.
+
+This module defines structural (duck-typed) interfaces that engine
+components depend on.  ``LanguageAdapter`` implements these protocols,
+but consumers import from here instead of from ``language_adapter``,
+eliminating the circular import chain.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Protocol
+
+from static_analyzer.engine.models import SymbolInfo
+
+
+class SymbolNaming(Protocol):
+    """Methods needed by SymbolTable to build and query symbol names."""
+
+    def build_qualified_name(
+        self,
+        file_path: Path,
+        symbol_name: str,
+        symbol_kind: int,
+        parent_chain: list[tuple[str, int]],
+        project_root: Path,
+        detail: str = "",
+    ) -> str: ...
+
+    def build_reference_key(self, qualified_name: str) -> str: ...
+
+    def is_class_like(self, symbol_kind: int) -> bool: ...
+
+    def is_callable(self, symbol_kind: int) -> bool: ...
+
+    @property
+    def reports_enum_members_as_fields(self) -> bool: ...
+
+
+class EdgeBuildAdapter(Protocol):
+    """Methods needed by edge-building strategies to query adapter config."""
+
+    @property
+    def resolves_method_groups(self) -> bool: ...
+
+    @property
+    def expands_virtual_dispatch(self) -> bool: ...
+
+    @property
+    def constructor_calls_resolve_to_class(self) -> bool: ...
+
+    def constructed_class(self, symbol: SymbolInfo) -> str | None: ...
+
+    def constructs(self, target: SymbolInfo, callee: str) -> bool: ...
+
+    def declared_apart(self, a: SymbolInfo, b: SymbolInfo) -> bool: ...
+
+    @property
+    def resolves_iterated_types(self) -> bool: ...
+
+    @property
+    def resolves_collection_initializers(self) -> bool: ...
+
+    def should_track_for_edges(self, symbol_kind: int) -> bool: ...
+
+    def is_class_like(self, symbol_kind: int) -> bool: ...
+
+    def is_callable(self, symbol_kind: int) -> bool: ...

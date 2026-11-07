@@ -1,0 +1,1458 @@
+"""Tests for static_analyzer.engine.lsp_client.LSPClient.
+
+These tests mock subprocess/IO to test the protocol logic
+without starting a real LSP server.
+"""
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from static_analyzer.engine.lsp_client import (
+    LSP_METHOD_NOT_FOUND,
+    BatchAnswer,
+    ErrorVerdict,
+    LSPClient,
+    MethodNotFoundError,
+)
+from static_analyzer.engine.lsp_constants import REQUEST_BATCH_SIZE
+from static_analyzer.exceptions import StaticAnalysisFatalError, WorkspaceSetupError
+
+
+class TestLSPClientInit:
+    def test_default_attributes(self):
+        client = LSPClient(["fake-server"], Path("/project"))
+        assert client._command == ["fake-server"]
+        assert client._default_timeout == 60
+        assert client._collect_diagnostics is False
+        assert client._process is None
+
+    def test_server_exit_reports_bounded_stderr_without_blocking(self, tmp_path):
+        code = (
+            "import sys; sys.stdin.buffer.readline(); "
+            "sys.stderr.write('old message\\n' + ('x' * 4096 + '\\n') * 80 + 'fatal compiler failure\\n'); "
+            "sys.stderr.flush(); sys.exit(7)"
+        )
+        client = LSPClient([sys.executable, "-c", code], tmp_path, startup_timeout=10)
+        try:
+            with pytest.raises(StaticAnalysisFatalError) as failure:
+                client.start()
+            assert "code 7" in str(failure.value)
+            assert "fatal compiler failure" in str(failure.value)
+            assert "old message" not in str(failure.value)
+            assert len(str(failure.value)) < 32 * 8192 + 1024
+            with pytest.raises(StaticAnalysisFatalError, match="code 7"):
+                client.check_alive()
+        finally:
+            client.shutdown()
+
+    def test_missing_ast_does_not_hide_dead_server(self, tmp_path):
+        client = LSPClient(["clangd"], tmp_path)
+        with patch.object(client, "_send_request", return_value=None):
+            with pytest.raises(StaticAnalysisFatalError, match="process exited"):
+                client.document_ast(tmp_path / "header.hpp")
+
+    def test_ast_timeout_still_fails(self, tmp_path):
+        client = LSPClient(["clangd"], tmp_path)
+        with patch.object(client, "_send_request", side_effect=TimeoutError("AST timed out")):
+            with pytest.raises(TimeoutError, match="AST timed out"):
+                client.document_ast(tmp_path / "header.hpp")
+
+    @pytest.mark.parametrize("invalidate", ["change", "close", "restart"])
+    def test_ast_reuse_expires_with_document_or_server_state(self, tmp_path, invalidate):
+        client = LSPClient(["clangd"], tmp_path)
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+        source = tmp_path / "source.cpp"
+        original = {"kind": "TranslationUnit", "children": [{"kind": "Function", "detail": "before"}]}
+        updated = {"kind": "TranslationUnit", "children": [{"kind": "Function", "detail": "after"}]}
+        with (
+            patch.object(client, "_send_request", return_value=original) as request,
+            patch.object(client, "_send_notification"),
+            patch.object(client, "start"),
+        ):
+            assert client.document_ast(source) == original
+            assert client.document_ast(source) == original
+            assert request.call_count == 1
+            request.return_value = updated
+            # Invalidating a header must also invalidate its including translation unit.
+            if invalidate == "change":
+                client.did_change(tmp_path / "header.hpp", "struct Changed {};")
+            elif invalidate == "close":
+                client.did_close(tmp_path / "header.hpp")
+            else:
+                client.restart()
+            assert client.document_ast(source) == updated
+            client._process.poll.return_value = 1
+            with pytest.raises(StaticAnalysisFatalError, match="process exited"):
+                client.document_ast(source)
+
+    def test_ast_reuse_has_a_node_budget_and_refreshes_recency(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("static_analyzer.engine.lsp_client.LSP_AST_NODE_BUDGET", 6)
+        client = LSPClient(["clangd"], tmp_path)
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+        trees = {
+            name: {"kind": name, "children": [{}] * size} for name, size in [("a", 1), ("b", 2), ("c", 1), ("big", 6)]
+        }
+        with patch.object(
+            client,
+            "_send_request",
+            side_effect=lambda _, params, timeout: trees[Path(params["textDocument"]["uri"]).name],
+        ) as request:
+            for name in ("a", "b", "a", "c", "a", "c"):
+                assert client.document_ast(tmp_path / name) == trees[name]
+            assert request.call_count == 3
+            assert client.document_ast(tmp_path / "b") == trees["b"]
+            assert request.call_count == 4
+            for _ in range(2):
+                assert client.document_ast(tmp_path / "big") == trees["big"]
+            assert request.call_count == 6
+
+    def test_unavailable_ast_is_not_cached(self, tmp_path):
+        client = LSPClient(["clangd"], tmp_path)
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+        tree = {"kind": "TranslationUnit", "children": [{"kind": "Function"}]}
+        with patch.object(client, "_send_request", side_effect=[None, tree]):
+            assert client.document_ast(tmp_path / "source.cpp") is None
+            assert client.document_ast(tmp_path / "source.cpp") == tree
+        assert client.get_collected_diagnostics() == {}
+
+    def test_custom_timeout(self):
+        client = LSPClient(["cmd"], Path("/root"), default_timeout=120)
+        assert client._default_timeout == 120
+
+    def test_initialize_waits_the_startup_timeout_and_requests_the_default(self):
+        client = LSPClient(["cmd"], Path("/root"), default_timeout=120, startup_timeout=900)
+        timeouts: dict[str, int] = {}
+
+        def fake_send_request(method, params, timeout=None):
+            timeouts[method] = timeout
+            return {}
+
+        with (
+            patch.object(client, "_send_request", side_effect=fake_send_request),
+            patch.object(client, "_send_notification"),
+            patch("subprocess.Popen") as mock_popen,
+            patch("os.dup", return_value=99),
+            patch("threading.Thread"),
+        ):
+            mock_popen.return_value.stdout.fileno.return_value = 5
+            client.start()
+
+        assert timeouts["initialize"] == 900
+        assert client._default_timeout == 120
+
+    def test_diagnostics_collection_flag(self):
+        client = LSPClient(["cmd"], Path("/root"), collect_diagnostics=True)
+        assert client._collect_diagnostics is True
+
+    def test_extra_client_capabilities_default_empty(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        assert client._extra_client_capabilities == {}
+
+    def test_extra_client_capabilities_stored(self):
+        caps = {"experimental": {"serverStatusNotification": True}}
+        client = LSPClient(["cmd"], Path("/root"), extra_client_capabilities=caps)
+        assert client._extra_client_capabilities == caps
+
+
+class TestExtraClientCapabilitiesMerge:
+    """Verify ``start()`` merges adapter-supplied capabilities into the
+    initialize request. Adapters that don't supply any keep the bare
+    base capabilities (no vendor-specific fields leak to other LSPs).
+    """
+
+    def _capture_init_request(
+        self, extra_caps: dict | None, folders: list[Path] | None = None, answer: dict | None = None
+    ) -> dict:
+        """Spawn an LSPClient with a fake process and capture the initialize params."""
+        client = LSPClient(["cmd"], Path("/root"), extra_client_capabilities=extra_caps, workspace_folders=folders)
+        captured: dict = {}
+
+        def fake_send_request(method, params, timeout=None):
+            if method == "initialize":
+                captured["params"] = params
+            return answer or {}
+
+        # Patch _send_request and _send_notification on the instance so the
+        # real start() body runs the merge logic but doesn't actually spawn a
+        # subprocess. The reader thread is also stubbed.
+        with (
+            patch.object(client, "_send_request", side_effect=fake_send_request),
+            patch.object(client, "_send_notification"),
+            patch("subprocess.Popen") as mock_popen,
+            patch("os.dup", return_value=99),
+            patch("threading.Thread"),
+        ):
+            mock_proc = MagicMock()
+            mock_proc.stdout.fileno.return_value = 5
+            mock_popen.return_value = mock_proc
+            client.start()
+        return captured.get("params", {})
+
+    def test_no_extra_caps_produces_only_text_document(self):
+        params = self._capture_init_request(None)
+        caps = params.get("capabilities", {})
+        assert "textDocument" in caps
+        # No experimental, no window, no vendor-specific fields.
+        assert "experimental" not in caps
+
+    def test_experimental_block_is_merged_at_top_level(self):
+        params = self._capture_init_request({"experimental": {"serverStatusNotification": True}})
+        caps = params.get("capabilities", {})
+        assert caps["experimental"] == {"serverStatusNotification": True}
+        # Base text-document capabilities still present.
+        assert "documentSymbol" in caps["textDocument"]
+
+    def test_overlapping_top_level_dict_keys_are_shallow_merged(self):
+        """If an adapter adds keys under ``textDocument`` they merge with the base."""
+        params = self._capture_init_request({"textDocument": {"semanticTokens": {"requests": {"full": True}}}})
+        caps = params.get("capabilities", {})
+        # Both base and adapter keys are present.
+        assert "documentSymbol" in caps["textDocument"]
+        assert caps["textDocument"]["semanticTokens"] == {"requests": {"full": True}}
+
+    def test_the_project_is_the_workspace_folder_unless_others_are_given(self):
+        default = self._capture_init_request(None)
+        assert [folder["uri"] for folder in default["workspaceFolders"]] == [Path("/root").as_uri()]
+        given = self._capture_init_request(None, [Path("/cache/sources")])
+        assert [folder["uri"] for folder in given["workspaceFolders"]] == [Path("/cache/sources").as_uri()]
+        assert given["rootUri"] == Path("/root").as_uri()
+
+    def test_adapter_value_wins_on_scalar_collision(self):
+        """A scalar override (rare) replaces the base value rather than crashing."""
+        params = self._capture_init_request({"textDocument": "broken"})
+        caps = params.get("capabilities", {})
+        # Adapter intentionally clobbered the dict — merge logic falls
+        # back to assignment when types don't match.
+        assert caps["textDocument"] == "broken"
+
+
+class TestCommands:
+    def test_the_commands_are_sent_once_initialized_and_again_on_a_restart(self):
+        command = {"command": "_typescript.configurePlugin", "arguments": ["plugin", {"members": {}}]}
+        client = LSPClient(["cmd"], Path("/root"), commands=[command])
+        sent: list[tuple[str, object]] = []
+
+        with (
+            patch.object(
+                client, "_send_request", side_effect=lambda method, params, **_: sent.append((method, params))
+            ),
+            patch.object(
+                client, "_send_notification", side_effect=lambda method, params: sent.append((method, params))
+            ),
+            patch("subprocess.Popen", side_effect=lambda *args, **kwargs: MagicMock()),
+            patch("os.dup", return_value=99),
+            patch("os.close"),
+            patch("threading.Thread"),
+        ):
+            client.start()
+            client.restart()
+
+        methods = [method for method, _ in sent]
+        executed = [index for index, method in enumerate(methods) if method == "workspace/executeCommand"]
+        assert len(executed) == 2
+        assert all(methods[index - 1] == "initialized" for index in executed)
+        assert sent[executed[0]][1] == command
+
+    @pytest.mark.parametrize("code", [-32601, -32603, None], ids=["method-not-found", "internal-error", "no-answer"])
+    def test_a_command_the_server_rejects_or_does_not_answer_fails_the_start(self, code: int | None):
+        """Otherwise the server answers without the plugin, and every cross-package call silently goes missing."""
+        client = LSPClient(
+            ["cmd"], Path("/root"), default_timeout=1, commands=[{"command": "_typescript.configurePlugin"}]
+        )
+        written: list[dict] = []
+
+        def respond(deadline: float) -> dict | None:
+            request = written[-1]
+            if request["method"] != "workspace/executeCommand":
+                return {"id": request["id"], "result": {}}
+            if code is None:
+                time.sleep(max(0.0, deadline - time.monotonic()))
+                return None
+            return {"id": request["id"], "error": {"code": code, "message": "rejected"}}
+
+        with (
+            patch.object(client, "_write_message", side_effect=written.append),
+            patch.object(client, "_next_response", side_effect=respond),
+            patch("subprocess.Popen", side_effect=lambda *args, **kwargs: MagicMock()),
+            patch("os.dup", return_value=99),
+            patch("threading.Thread"),
+            pytest.raises(WorkspaceSetupError, match="rejected" if code else "did not answer"),
+        ):
+            client.start()
+
+
+class TestWriteMessage:
+    def test_writes_json_rpc_with_content_length(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        mock_stdin = MagicMock()
+        mock_process = MagicMock()
+        mock_process.stdin = mock_stdin
+        client._process = mock_process
+
+        client._write_message({"jsonrpc": "2.0", "id": 1, "method": "test"})
+
+        mock_stdin.write.assert_called_once()
+        written = mock_stdin.write.call_args[0][0]
+        assert b"Content-Length:" in written
+        assert b'"jsonrpc": "2.0"' in written
+        mock_stdin.flush.assert_called_once()
+
+    def test_raises_when_not_running(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = None
+
+        with pytest.raises(RuntimeError, match="LSP server not running"):
+            client._write_message({"test": True})
+
+
+class TestNextResponse:
+    def test_returns_response_from_queue(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        response = {"jsonrpc": "2.0", "id": 1, "result": {"key": "value"}}
+        client._msg_queue.put(response)
+
+        import time
+
+        result = client._next_response(time.monotonic() + 5)
+        assert result == response
+
+    def test_returns_none_on_timeout(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        import time
+
+        result = client._next_response(time.monotonic() + 0.01)
+        assert result is None
+
+    def test_returns_none_when_deadline_passed(self):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        import time
+
+        result = client._next_response(time.monotonic() - 1)
+        assert result is None
+
+    def test_server_requests_pass_through_next_response(self):
+        """Server-initiated requests are no longer intercepted by _next_response.
+
+        Replaces test_handles_server_initiated_request — that test verified
+        _next_response handled server requests and returned None.  Handling
+        moved to _reader_loop (csharp-ls blocks on registerCapability until
+        the client responds; deferring to _next_response caused a deadlock).
+        """
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        server_req = {"jsonrpc": "2.0", "id": 99, "method": "workspace/configuration", "params": {}}
+        client._msg_queue.put(server_req)
+
+        import time
+
+        result = client._next_response(time.monotonic() + 5)
+        assert result is not None
+        assert result["id"] == 99
+
+    def test_skips_notifications(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        # Notification (no 'id')
+        notification = {"jsonrpc": "2.0", "method": "some/notification", "params": {}}
+        client._msg_queue.put(notification)
+
+        import time
+
+        result = client._next_response(time.monotonic() + 5)
+        assert result is None
+
+    def test_raises_on_dead_server(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = 1
+        client._process.returncode = 1
+
+        import time
+
+        with pytest.raises(RuntimeError, match="LSP server process exited"):
+            client._next_response(time.monotonic() + 5)
+
+
+class TestOutgoingCallsBatch:
+    def test_outgoing_batches_keep_multiple_items_and_empty_queries_in_order(self, monkeypatch):
+        monkeypatch.setattr("static_analyzer.engine.lsp_client.REQUEST_BATCH_SIZE", 2)
+        client = LSPClient(["clangd"], Path("/root"))
+        pending: list[dict] = []
+        rounds = []
+        retried = False
+        collect = client._collect_batch_responses
+
+        def answer(method, ids, timeout):
+            nonlocal retried
+            rounds.append(len(pending))
+            for message in reversed(pending):
+                response = {"id": message["id"]}
+                if method == "textDocument/prepareCallHierarchy":
+                    line = message["params"]["position"]["line"]
+                    response["result"] = [{"data": name} for name in {0: ["a", "b"], 1: [], 2: ["c"]}[line]]
+                else:
+                    name = message["params"]["item"]["data"]
+                    if name == "a" and not retried:
+                        response["error"] = {"code": -32801, "message": "Content modified"}
+                        retried = True
+                    else:
+                        response["result"] = [{"to": {"name": name}}]
+                client._msg_queue.put(response)
+            pending.clear()
+            return collect(method, ids, timeout)
+
+        with (
+            patch.object(client, "_write_message", side_effect=pending.append),
+            patch.object(client, "_collect_batch_responses", side_effect=answer),
+        ):
+            assert client.outgoing_calls_batch([(Path("/root/a.cpp"), line, 0) for line in range(3)]) == [
+                [{"to": {"name": "a"}}, {"to": {"name": "b"}}],
+                [],
+                [{"to": {"name": "c"}}],
+            ]
+            assert client.outgoing_calls_batch([]) == []
+        assert retried
+        assert max(rounds) == 2
+
+
+class TestDocumentSymbol:
+    def test_returns_list_result(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        symbols = [{"name": "foo", "kind": 12}]
+
+        with patch.object(client, "_send_request", return_value=symbols):
+            result = client.document_symbol(Path("/root/test.py"))
+
+        assert result == symbols
+
+    def test_returns_empty_list_for_none(self):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        with patch.object(client, "_send_request", return_value=None):
+            result = client.document_symbol(Path("/root/test.py"))
+
+        assert result == []
+
+
+class TestTypeHierarchy:
+    def test_prepare_returns_list(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._server_capabilities = {"typeHierarchyProvider": True}
+        items = [{"name": "Foo", "kind": 5}]
+
+        with patch.object(client, "_send_request", return_value=items):
+            result = client.type_hierarchy_prepare(Path("/root/test.py"), 0, 0)
+
+        assert result == items
+
+    def test_prepare_returns_none_for_non_list(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._server_capabilities = {"typeHierarchyProvider": True}
+
+        with patch.object(client, "_send_request", return_value=None):
+            result = client.type_hierarchy_prepare(Path("/root/test.py"), 0, 0)
+
+        assert result is None
+
+    def test_supertypes_returns_list(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        types = [{"name": "Base"}]
+
+        with patch.object(client, "_send_request", return_value=types):
+            result = client.type_hierarchy_supertypes({"name": "Child"})
+
+        assert result == types
+
+    def test_subtypes_returns_empty_for_none(self):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        with patch.object(client, "_send_request", return_value=None):
+            result = client.type_hierarchy_subtypes({"name": "Parent"})
+
+        assert result == []
+
+
+class TestSendRequest:
+    def test_returns_result(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        mock_stdin = MagicMock()
+        mock_process = MagicMock()
+        mock_process.stdin = mock_stdin
+        mock_process.poll.return_value = None
+        client._process = mock_process
+
+        # Queue a matching response
+        response = {"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {}}}
+        client._msg_queue.put(response)
+
+        result = client._send_request("test/method", {"key": "value"}, timeout=5)
+        assert result == {"capabilities": {}}
+
+    def test_raises_method_not_found(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        mock_stdin = MagicMock()
+        mock_process = MagicMock()
+        mock_process.stdin = mock_stdin
+        mock_process.poll.return_value = None
+        client._process = mock_process
+
+        error_response = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": LSP_METHOD_NOT_FOUND, "message": "Method not found"},
+        }
+        client._msg_queue.put(error_response)
+
+        with pytest.raises(MethodNotFoundError):
+            client._send_request("unknown/method", {}, timeout=5)
+
+    def test_returns_none_on_other_error(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        mock_stdin = MagicMock()
+        mock_process = MagicMock()
+        mock_process.stdin = mock_stdin
+        mock_process.poll.return_value = None
+        client._process = mock_process
+
+        error_response = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32000, "message": "Server error"},
+        }
+        client._msg_queue.put(error_response)
+
+        result = client._send_request("test/method", {}, timeout=5)
+        assert result is None
+
+    def test_raises_timeout(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        mock_stdin = MagicMock()
+        mock_process = MagicMock()
+        mock_process.stdin = mock_stdin
+        mock_process.poll.return_value = None
+        client._process = mock_process
+
+        # Queue no matching response
+        with pytest.raises(TimeoutError):
+            client._send_request("test/method", {}, timeout=1)
+
+    def test_skips_non_matching_ids(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        mock_stdin = MagicMock()
+        mock_process = MagicMock()
+        mock_process.stdin = mock_stdin
+        mock_process.poll.return_value = None
+        client._process = mock_process
+
+        # Queue a response with wrong id, then the correct one
+        wrong = {"jsonrpc": "2.0", "id": 999, "result": "wrong"}
+        correct = {"jsonrpc": "2.0", "id": 1, "result": "correct"}
+        client._msg_queue.put(wrong)
+        client._msg_queue.put(correct)
+
+        result = client._send_request("test/method", {}, timeout=5)
+        assert result == "correct"
+
+
+class TestCollectBatchResponses:
+    def test_collects_all_responses(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        # Queue responses out of order
+        client._msg_queue.put({"jsonrpc": "2.0", "id": 2, "result": [{"b": 1}]})
+        client._msg_queue.put({"jsonrpc": "2.0", "id": 1, "result": [{"a": 1}]})
+
+        results, timed_out, _ = client._collect_batch_responses("textDocument/definition", [1, 2], timeout=5)
+
+        assert results[1] == [{"a": 1}]
+        assert results[2] == [{"b": 1}]
+        assert timed_out == set()
+
+    def test_reports_timed_out_ids(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        # Only queue one of two expected responses
+        client._msg_queue.put({"jsonrpc": "2.0", "id": 1, "result": [{"a": 1}]})
+
+        results, timed_out, _ = client._collect_batch_responses("textDocument/definition", [1, 2], timeout=1)
+
+        assert results[1] == [{"a": 1}]
+        assert results[2] == []
+        assert timed_out == {2}
+
+    def test_a_reserved_error_code_means_the_request_was_not_served(self):
+        """``ContentModified`` and friends say the server could not answer, not that it did."""
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        error = {"code": -32801, "message": "content modified"}
+        client._msg_queue.put({"jsonrpc": "2.0", "id": 1, "error": error})
+
+        results, unserved, _ = client._collect_batch_responses("textDocument/definition", [1], timeout=5)
+        assert results[1] == []
+        assert unserved == {1}
+
+    def test_the_text_sent_to_the_server_does_not_depend_on_the_locale(self, tmp_path: Path):
+        """Source is UTF-8 everywhere; the locale's encoding is cp1252 on Windows.
+
+        Decoded as cp1252 a line holding non-ASCII text reaches the server one character
+        per extra byte longer than it is, so every column this client sends after it names
+        a different place in the server's buffer than in the file tree-sitter read.
+        """
+        # Why the escapes: tests/test_windows_encoding.py forbids source characters cp1252
+        # cannot encode, and Greek is outside it. The text still holds them at runtime.
+        line = 'label = "café — \u03b1\u03b2\u03b3"'
+        source = tmp_path / "app.py"
+        source.write_text(f"{line}\ntarget()\n", encoding="utf-8")
+        client = LSPClient(["cmd"], Path(tmp_path))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        asked: list[str | None] = []
+        read_text = Path.read_text
+
+        def record(self: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            asked.append(encoding)
+            return read_text(self, encoding=encoding, errors=errors)
+
+        with patch.object(Path, "read_text", record), patch.object(LSPClient, "_send_notification") as notify:
+            client.did_open(source)
+
+        assert asked == ["utf-8"]
+        assert notify.call_args.args[1]["textDocument"]["text"].splitlines()[0] == line
+
+    def test_a_long_batch_is_asked_in_rounds_and_answered_in_order(self):
+        """A round per ``REQUEST_BATCH_SIZE`` queries, so no caller has to chunk a long file itself."""
+        client = LSPClient(["cmd"], Path("/root"))
+        rounds: list[int] = []
+
+        def ask(method, queries, build_params, timeout):
+            rounds.append(len(queries))
+            return [BatchAnswer([{"line": line}], served=True, retryable=False) for _, line, _ in queries]
+
+        count = REQUEST_BATCH_SIZE * 2 + 1
+        with patch.object(client, "_send_round", side_effect=ask):
+            results = client.send_definition_batch([(Path("/root/a.py"), line, 0) for line in range(count)])
+
+        assert rounds == [REQUEST_BATCH_SIZE, REQUEST_BATCH_SIZE, 1]
+        assert [answer[0]["line"] for answer in results] == list(range(count))
+
+    def test_an_unimplemented_definition_method_is_fatal(self):
+        """Every call site would resolve to nothing and the run would report success."""
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        client._msg_queue.put({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "Method not found"}})
+
+        with pytest.raises(StaticAnalysisFatalError):
+            client._collect_batch_responses("textDocument/definition", [1], timeout=5)
+
+    def test_an_unimplemented_method_is_still_an_answer(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        error = {"code": -32601, "message": "Method not found"}
+        client._msg_queue.put({"jsonrpc": "2.0", "id": 1, "error": error})
+
+        _, unserved, _ = client._collect_batch_responses("textDocument/implementation", [1], timeout=5)
+        assert unserved == set()
+
+    def test_an_error_is_an_answer_not_a_hole(self):
+        """gopls declines an implementation query on a free function with an error.
+
+        "X is a function, not a method" is a complete negative answer, not a request that
+        went missing, so it must not fail the run the way a timeout does.
+        """
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        error = {"code": 0, "message": "Add is a function, not a method"}
+        client._msg_queue.put({"jsonrpc": "2.0", "id": 1, "error": error})
+
+        results, unserved, _ = client._collect_batch_responses("textDocument/implementation", [1], timeout=5)
+        assert results[1] == []
+        assert unserved == set()
+
+    def test_an_application_error_code_below_the_reserved_bands_is_an_answer(self):
+        """The two reserved bands are bounded; a code outside them is the server's own.
+
+        Reading one as a protocol failure fails the whole run over a question the server
+        answered.
+        """
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        client._msg_queue.put({"jsonrpc": "2.0", "id": 1, "error": {"code": -40000, "message": "no target"}})
+
+        results, unserved, _ = client._collect_batch_responses("textDocument/definition", [1], timeout=5)
+        assert results[1] == []
+        assert unserved == set()
+
+    @pytest.mark.parametrize(
+        "code,served",
+        [
+            (-32900, True),  # below every reserved band
+            (-32899, False),  # lspReservedErrorRangeStart
+            (-32800, False),  # RequestCancelled, the band's end
+            (-32799, True),  # between the two bands
+            (-32768, False),  # the JSON-RPC band's start
+            (-32000, False),  # the JSON-RPC band's end
+            (-31999, True),  # above every reserved band
+        ],
+    )
+    def test_the_reserved_bands_have_edges(self, code: int, served: bool):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        client._msg_queue.put({"jsonrpc": "2.0", "id": 1, "error": {"code": code, "message": "x"}})
+
+        _, unserved, _ = client._collect_batch_responses("textDocument/definition", [1], timeout=5)
+        assert (unserved == set()) is served
+
+    def test_a_server_that_exited_is_fatal_not_a_missing_answer(self):
+        """Every later query is unanswerable, so a caller must not read the failure as empty."""
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = 1
+        client._process.returncode = 1
+
+        with pytest.raises(StaticAnalysisFatalError):
+            client._collect_batch_responses("textDocument/definition", [1], timeout=1)
+
+    def test_deduplicates_declined_request_logging(self, caplog):
+        """Repeated declines are logged once with a count, not per-request."""
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+
+        # Queue 3 identical errors
+        for i in range(1, 4):
+            client._msg_queue.put({"jsonrpc": "2.0", "id": i, "error": {"code": 0, "message": "no package metadata"}})
+
+        import logging
+
+        with caplog.at_level(logging.DEBUG):
+            _, timed_out, _ = client._collect_batch_responses("textDocument/definition", [1, 2, 3], timeout=5)
+
+        assert timed_out == set()
+        declined = [r for r in caplog.records if "no package metadata" in r.message]
+        assert len(declined) == 1
+        assert "x3" in declined[0].message
+
+
+class TestHandleNotification:
+    def test_diagnostics_notification(self):
+        client = LSPClient(["cmd"], Path("/root"), collect_diagnostics=True)
+
+        params = {
+            "uri": Path("/root/test.py").as_uri(),
+            "diagnostics": [
+                {
+                    "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 10}},
+                    "message": "Unused import",
+                    "severity": 2,
+                    "code": "W0611",
+                }
+            ],
+        }
+
+        client._handle_notification("textDocument/publishDiagnostics", params)
+
+        diags = client.get_collected_diagnostics()
+        assert len(diags) == 1
+        file_key = next(iter(diags))
+        assert len(diags[file_key]) == 1
+        assert diags[file_key][0].message == "Unused import"
+
+    def test_diagnostics_generation_increments(self):
+        client = LSPClient(["cmd"], Path("/root"), collect_diagnostics=True)
+        assert client.get_diagnostics_generation() == 0
+
+        params = {
+            "uri": Path("/root/test.py").as_uri(),
+            "diagnostics": [
+                {
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+                    "message": "error 1",
+                    "severity": 1,
+                }
+            ],
+        }
+        client._handle_notification("textDocument/publishDiagnostics", params)
+        assert client.get_diagnostics_generation() == 1
+
+        # Second notification for a different file bumps again
+        params["uri"] = Path("/root/other.py").as_uri()
+        client._handle_notification("textDocument/publishDiagnostics", params)
+        assert client.get_diagnostics_generation() == 2
+
+    def test_service_ready_notification(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        assert not client._server_ready.is_set()
+
+        client._handle_notification("language/status", {"type": "ServiceReady", "message": ""})
+
+        assert client._server_ready.is_set()
+
+    def test_project_status_ok_notification(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        assert not client._server_ready.is_set()
+
+        client._handle_notification("language/status", {"type": "ProjectStatus", "message": "OK"})
+
+        assert client._server_ready.is_set()
+
+    def test_a_finished_build_import_is_remembered(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        assert not client.import_finished.is_set()
+
+        client._handle_notification("intellij/workspaceImportState", {"phase": "IMPORTING"})
+        assert not client.import_finished.is_set()
+        client._handle_notification(
+            "intellij/workspaceImportState",
+            {"phase": "FINISHED", "folders": [{"folderUri": "file:///root/", "status": "BLOCKED"}]},
+        )
+
+        assert client.import_finished.is_set()
+        assert client.import_phase == "FINISHED"
+        assert client.import_folder_statuses == ["BLOCKED"]
+
+    def test_indexing_after_the_import_does_not_unready_the_server(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._handle_notification("intellij/workspaceImportState", {"phase": "FINISHED", "folders": []})
+        client._handle_notification("$/progress", {"token": "t", "value": {"kind": "begin", "title": "Indexing"}})
+        assert client._server_ready.is_set()
+
+    def test_progress_quiet_waits_out_an_open_indexing_pass(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._handle_notification("$/progress", {"token": "t", "value": {"kind": "begin", "title": "Indexing"}})
+        assert not client.wait_for_progress_quiet("indexing", 0.1, 0.5)
+        client._handle_notification("$/progress", {"token": "t", "value": {"kind": "end"}})
+        assert client.wait_for_progress_quiet("indexing", 0.1, 2)
+
+    def test_a_build_import_reported_failed_is_remembered(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._handle_notification("intellij/importLog", {"type": 3, "message": "[INFO] Scanning", "failed": False})
+        assert not client.import_failed
+        client._handle_notification("intellij/importLog", {"type": 1, "message": "Unable to import", "failed": True})
+        assert client.import_failed
+
+    def test_a_failed_build_import_also_ends_the_wait(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._handle_notification("intellij/workspaceImportState", {"phase": "FAILED"})
+        assert client.import_finished.is_set()
+        assert client.import_phase == "FAILED"
+
+    def test_ignores_non_ready_status(self):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        client._handle_notification("language/status", {"type": "Starting", "message": "loading..."})
+
+        assert not client._server_ready.is_set()
+
+    def test_rust_analyzer_quiescent_ok_marks_ready(self):
+        """rust-analyzer's ``experimental/serverStatus`` with ``quiescent=true`` is the ready signal."""
+        client = LSPClient(["cmd"], Path("/root"))
+        assert not client._server_ready.is_set()
+
+        client._handle_notification(
+            "experimental/serverStatus",
+            {"health": "ok", "quiescent": True},
+        )
+
+        assert client._server_ready.is_set()
+
+    def test_rust_analyzer_quiescent_warning_marks_ready(self):
+        """A ``warning`` health is still ready — it just means diagnostics found something."""
+        client = LSPClient(["cmd"], Path("/root"))
+
+        client._handle_notification(
+            "experimental/serverStatus",
+            {"health": "warning", "quiescent": True},
+        )
+
+        assert client._server_ready.is_set()
+        assert client.server_health == "warning"
+
+    def test_rust_analyzer_records_error_health_message(self):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        client._handle_notification(
+            "experimental/serverStatus",
+            {"health": "error", "quiescent": True, "message": "cargo metadata failed"},
+        )
+
+        assert client._server_ready.is_set()
+        assert client.server_health == "error"
+        assert client.server_health_message == "cargo metadata failed"
+
+    def test_rust_analyzer_non_quiescent_does_not_mark_ready(self):
+        """Status updates during indexing should not unblock waiters."""
+        client = LSPClient(["cmd"], Path("/root"))
+
+        client._handle_notification(
+            "experimental/serverStatus",
+            {"health": "ok", "quiescent": False},
+        )
+
+        assert not client._server_ready.is_set()
+
+    def test_csharp_ls_solution_loaded_signals_ready(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        assert not client._server_ready.is_set()
+        client._handle_notification(
+            "window/logMessage",
+            {"type": 3, "message": 'csharp-ls: Finished loading solution "/foo/Bar.sln"'},
+        )
+        assert client._server_ready.is_set()
+
+    def test_csharp_ls_progress_end_signals_ready(self):
+        # csharp-ls reports csproj-based load completion via $/progress, not logMessage
+        client = LSPClient(["cmd"], Path("/root"))
+        assert not client._server_ready.is_set()
+        client._handle_notification(
+            "$/progress",
+            {
+                "token": "abc",
+                "value": {"kind": "end", "message": "OK, 1 project file(s) loaded"},
+            },
+        )
+        assert client._server_ready.is_set()
+
+    def test_progress_begin_does_not_signal_ready(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._handle_notification(
+            "$/progress",
+            {"token": "abc", "value": {"kind": "begin", "title": "Loading", "message": "0/1"}},
+        )
+        assert not client._server_ready.is_set()
+
+    def test_progress_ignores_invalid_token(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._handle_notification(
+            "$/progress",
+            {"token": {}, "value": {"kind": "begin", "title": "Loading"}},
+        )
+
+        assert client._work_done_progress_titles == {}
+
+    def test_gopls_workspace_progress_end_signals_ready(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._handle_notification(
+            "$/progress",
+            {"token": "workspace", "value": {"kind": "begin", "title": "Setting up workspace"}},
+        )
+        client._handle_notification(
+            "$/progress",
+            {"token": "workspace", "value": {"kind": "end", "message": "Finished loading packages."}},
+        )
+        assert client._server_ready.is_set()
+
+    def test_failed_gopls_workspace_progress_does_not_signal_ready(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._handle_notification(
+            "$/progress",
+            {"token": "workspace", "value": {"kind": "begin", "title": "Setting up workspace"}},
+        )
+        client._handle_notification(
+            "$/progress",
+            {"token": "workspace", "value": {"kind": "report", "message": "workspace load failed"}},
+        )
+        client._handle_notification(
+            "$/progress",
+            {"token": "workspace", "value": {"kind": "end", "message": "Done."}},
+        )
+
+        assert not client._server_ready.is_set()
+
+    def test_intelephense_progress_end_signals_ready(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._server_ready.set()
+        client._handle_notification(
+            "$/progress",
+            {"token": "index", "value": {"kind": "begin", "title": "Indexing workspace"}},
+        )
+        assert not client._server_ready.is_set()
+        client._handle_notification(
+            "$/progress",
+            {"token": "index", "value": {"kind": "end", "message": "Done."}},
+        )
+
+        assert client._server_ready.is_set()
+
+    def test_intelephense_indexing_notifications_signal_ready(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._server_ready.set()
+
+        client._handle_notification("indexingStarted", {})
+        assert not client._server_ready.is_set()
+
+        client._handle_notification("indexingEnded", {})
+        assert client._server_ready.is_set()
+
+
+class TestWaitForServerReady:
+    def test_returns_immediately_when_already_ready(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._server_ready.set()
+
+        # Should not block
+        client.wait_for_server_ready(timeout=1)
+
+    def test_times_out_gracefully(self):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        # Should not raise, just log warning
+        client.wait_for_server_ready(timeout=1)
+        assert not client._server_ready.is_set()
+
+    def test_bails_out_fast_when_init_failed(self):
+        # When initialize errored, waiting 5 minutes for a ready signal that
+        # will never come is wasted time. The wait must return immediately.
+        import time
+
+        client = LSPClient(["cmd"], Path("/root"))
+        client._init_failed = True
+        t0 = time.monotonic()
+        client.wait_for_server_ready(timeout=10)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.5, f"wait_for_server_ready should return fast on init failure (took {elapsed:.2f}s)"
+
+
+class TestSendRequestInitFailed:
+    """Initialize-error bookkeeping so wait_for_server_ready can bail fast."""
+
+    def test_initialize_error_marks_init_failed(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+        client._process.stdin = MagicMock()
+        # csharp-ls signature: error response to initialize
+        err = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "boom"}}
+        client._msg_queue.put(err)
+
+        client._send_request("initialize", {}, timeout=5)
+        assert client._init_failed is True
+
+    def test_non_initialize_error_does_not_mark_init_failed(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+        client._process.stdin = MagicMock()
+        err = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "x"}}
+        client._msg_queue.put(err)
+
+        client._send_request("textDocument/references", {}, timeout=5)
+        assert client._init_failed is False
+
+
+class TestWaitForDiagnosticsQuiesce:
+    """csharp-ls and other batching servers publish diagnostics asynchronously
+    after didOpen. The analyzer must wait for the stream to settle before
+    snapshotting, otherwise the live diagnostics map is empty."""
+
+    def test_zero_args_returns_immediately(self):
+        import time
+
+        client = LSPClient(["cmd"], Path("/root"))
+        t0 = time.monotonic()
+        client.wait_for_diagnostics_quiesce(0, 0)
+        assert time.monotonic() - t0 < 0.1
+
+    def test_returns_after_idle_seconds_with_no_traffic(self):
+        import time
+
+        client = LSPClient(["cmd"], Path("/root"))
+        t0 = time.monotonic()
+        client.wait_for_diagnostics_quiesce(idle_seconds=0.3, max_wait=2.0)
+        elapsed = time.monotonic() - t0
+        assert 0.3 <= elapsed < 1.5
+
+    def test_extends_wait_when_diagnostics_keep_arriving(self):
+        import threading
+        import time
+
+        client = LSPClient(["cmd"], Path("/root"), collect_diagnostics=True)
+
+        def burst():
+            for i in range(5):
+                time.sleep(0.1)
+                params = {
+                    "uri": Path(f"/root/f{i}.cs").as_uri(),
+                    "diagnostics": [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1},
+                            },
+                            "message": "x",
+                            "severity": 1,
+                        }
+                    ],
+                }
+                client._handle_notification("textDocument/publishDiagnostics", params)
+
+        threading.Thread(target=burst, daemon=True).start()
+        t0 = time.monotonic()
+        client.wait_for_diagnostics_quiesce(idle_seconds=0.3, max_wait=3.0)
+        elapsed = time.monotonic() - t0
+        # Burst lasts ~0.5s, then we wait 0.3s idle = ~0.8s total
+        assert 0.6 <= elapsed < 1.5
+        assert client.get_diagnostics_generation() == 5
+
+    def test_max_wait_is_a_hard_ceiling(self):
+        import threading
+        import time
+
+        client = LSPClient(["cmd"], Path("/root"), collect_diagnostics=True)
+        stop = threading.Event()
+
+        def flood():
+            i = 0
+            while not stop.is_set():
+                params = {
+                    "uri": Path(f"/root/f{i}.cs").as_uri(),
+                    "diagnostics": [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1},
+                            },
+                            "message": "x",
+                            "severity": 1,
+                        }
+                    ],
+                }
+                client._handle_notification("textDocument/publishDiagnostics", params)
+                time.sleep(0.05)
+                i += 1
+
+        t = threading.Thread(target=flood, daemon=True)
+        t.start()
+        try:
+            t0 = time.monotonic()
+            client.wait_for_diagnostics_quiesce(idle_seconds=1.0, max_wait=0.8)
+            elapsed = time.monotonic() - t0
+            assert 0.7 <= elapsed < 1.5
+        finally:
+            stop.set()
+            t.join(timeout=1)
+
+
+class TestReadSingleMessage:
+    def test_reads_valid_message(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": "ok"}).encode("utf-8")
+        raw = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8") + body
+
+        # Use a pipe to simulate stdout
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, raw)
+        os.close(write_fd)
+
+        client._stdout_fd = read_fd
+        msg = client._read_single_message()
+
+        assert msg is not None
+        assert msg["id"] == 1
+        assert msg["result"] == "ok"
+
+        os.close(read_fd)
+
+    def test_returns_none_for_no_fd(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._stdout_fd = None
+
+        assert client._read_single_message() is None
+
+    def test_returns_none_for_missing_content_length(self):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        # Header without Content-Length
+        raw = b"X-Custom: value\r\n\r\n"
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, raw)
+        os.close(write_fd)
+
+        client._stdout_fd = read_fd
+        msg = client._read_single_message()
+
+        assert msg is None
+        os.close(read_fd)
+
+
+class TestContextManager:
+    @patch.object(LSPClient, "start")
+    @patch.object(LSPClient, "shutdown")
+    def test_enter_exit(self, mock_shutdown, mock_start):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        with client as c:
+            assert c is client
+
+        mock_start.assert_called_once()
+        mock_shutdown.assert_called_once()
+
+
+class TestDidOpenDidChangeDidClose:
+    def test_did_open_sends_notification(self):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        with patch.object(client, "_send_notification") as mock_notif:
+            with patch.object(Path, "read_text", return_value="print('hi')"):
+                client.did_open(Path("/root/test.py"))
+
+            mock_notif.assert_called_once()
+            args = mock_notif.call_args[0]
+            assert args[0] == "textDocument/didOpen"
+            assert args[1]["textDocument"]["languageId"] == "python"
+
+    def test_did_change_sends_notification(self):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        with patch.object(client, "_send_notification") as mock_notif:
+            client.did_change(Path("/root/test.py"), "new content")
+
+            mock_notif.assert_called_once()
+            args = mock_notif.call_args[0]
+            assert args[0] == "textDocument/didChange"
+            assert args[1]["contentChanges"][0]["text"] == "new content"
+
+    def test_did_change_auto_increments_version(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        file_path = Path("/root/test.py")
+
+        with patch.object(client, "_send_notification") as mock_notif:
+            client.did_change(file_path, "v1")
+            client.did_change(file_path, "v2")
+            client.did_change(file_path, "v3")
+
+            versions = [call[0][1]["textDocument"]["version"] for call in mock_notif.call_args_list]
+            assert versions == [2, 3, 4]
+
+    def test_did_change_continues_version_after_did_open(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        file_path = Path("/root/test.py")
+
+        with patch.object(client, "_send_notification") as mock_notif:
+            with patch.object(Path, "read_text", return_value=""):
+                client.did_open(file_path)
+            client.did_change(file_path, "edited")
+
+            change_args = mock_notif.call_args_list[-1][0]
+            assert change_args[1]["textDocument"]["version"] == 2
+
+    def test_did_open_is_idempotent(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        file_path = Path("/root/test.py")
+
+        with patch.object(client, "_send_notification") as mock_notif:
+            with patch.object(Path, "read_text", return_value="content"):
+                client.did_open(file_path)
+                client.did_open(file_path)
+
+            # Only one didOpen should be sent
+            assert mock_notif.call_count == 1
+
+    def test_did_close_sends_notification(self):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        with patch.object(client, "_send_notification") as mock_notif:
+            client.did_close(Path("/root/test.py"))
+
+            mock_notif.assert_called_once()
+            args = mock_notif.call_args[0]
+            assert args[0] == "textDocument/didClose"
+
+    def test_did_close_allows_reopen(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        file_path = Path("/root/test.py")
+
+        with patch.object(client, "_send_notification") as mock_notif:
+            with patch.object(Path, "read_text", return_value="content"):
+                client.did_open(file_path)
+                client.did_close(file_path)
+                client.did_open(file_path)
+
+            methods = [call[0][0] for call in mock_notif.call_args_list]
+            assert methods == ["textDocument/didOpen", "textDocument/didClose", "textDocument/didOpen"]
+
+    def test_did_open_handles_unreadable_file(self):
+        client = LSPClient(["cmd"], Path("/root"))
+
+        with patch.object(client, "_send_notification") as mock_notif:
+            with patch.object(Path, "read_text", side_effect=PermissionError):
+                client.did_open(Path("/root/test.py"))
+
+            # Should still send with empty text
+            args = mock_notif.call_args[0]
+            assert args[1]["textDocument"]["text"] == ""
+
+
+class TestShutdown:
+    def test_shutdown_sends_requests_and_terminates(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        mock_process = MagicMock()
+        mock_process.poll.return_value = None
+        client._process = mock_process
+        client._stdout_fd = None
+
+        with (
+            patch.object(client, "_send_request") as mock_req,
+            patch.object(client, "_send_notification") as mock_notif,
+        ):
+            client.shutdown()
+
+        mock_req.assert_called_once_with("shutdown", None, timeout=5)
+        mock_notif.assert_called_once_with("exit", None)
+        mock_process.terminate.assert_called_once()
+
+    def test_shutdown_handles_already_dead_process(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        mock_process = MagicMock()
+        mock_process.poll.return_value = 0  # Already dead
+        client._process = mock_process
+
+        # Should not raise
+        client.shutdown()
+
+    def test_shutdown_closes_stdout_fd(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = 0
+
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        client._stdout_fd = read_fd
+
+        client.shutdown()
+
+        assert client._stdout_fd is None
+
+    def test_shutdown_clears_document_tracking(self):
+        client = LSPClient(["cmd"], Path("/root"))
+        client._process = MagicMock()
+        client._process.poll.return_value = 0
+
+        # Simulate having opened a file
+        uri = Path("/root/test.py").resolve().as_uri()
+        client._opened_uris.add(uri)
+        client._doc_versions[uri] = 3
+
+        client.shutdown()
+
+        assert len(client._opened_uris) == 0
+        assert len(client._doc_versions) == 0
+
+
+class TestServerCapabilities:
+    def _started(self, capabilities: dict) -> LSPClient:
+        client = LSPClient(["cmd"], Path("/root"))
+        with (
+            patch.object(client, "_send_request", return_value={"capabilities": capabilities}),
+            patch.object(client, "_send_notification"),
+            patch("subprocess.Popen") as mock_popen,
+            patch("os.dup", return_value=99),
+            patch("threading.Thread"),
+        ):
+            mock_popen.return_value.stdout.fileno.return_value = 5
+            client.start()
+        return client
+
+    def test_what_initialize_offers_is_remembered(self):
+        client = self._started({"implementationProvider": True, "typeHierarchyProvider": False})
+        assert client.advertises("implementationProvider")
+        assert not client.advertises("typeHierarchyProvider")
+        assert not client.advertises("callHierarchyProvider")
+
+    def test_implementations_are_not_asked_of_a_server_not_offering_them(self):
+        """A server can answer a request it does not offer with an internal error."""
+        client = self._started({})
+        with patch.object(client, "_send_batch") as send:
+            assert client.send_implementation_batch([(Path("/root/a.kt"), 0, 0)] * 2) == [[], []]
+        send.assert_not_called()
+
+    def test_implementations_are_asked_of_a_server_offering_them(self):
+        client = self._started({"implementationProvider": True})
+        with patch.object(client, "_send_batch", return_value=[[{"uri": "x"}]]) as send:
+            assert client.send_implementation_batch([(Path("/root/a.kt"), 0, 0)]) == [[{"uri": "x"}]]
+        send.assert_called_once()
+
+    def test_a_type_hierarchy_not_offered_reads_as_method_not_found(self):
+        client = self._started({})
+        with patch.object(client, "_send_request") as send:
+            with pytest.raises(MethodNotFoundError):
+                client.type_hierarchy_prepare(Path("/root/a.kt"), 0, 0)
+        send.assert_not_called()
+
+
+class TestErrorVerdicts:
+    def _collect(self, verdict: ErrorVerdict, error: dict) -> tuple[dict, set, set]:
+        client = LSPClient(["cmd"], Path("/root"), error_verdict=lambda _: verdict)
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+        client._msg_queue.put({"jsonrpc": "2.0", "id": 1, "error": error})
+        return client._collect_batch_responses("textDocument/definition", [1], timeout=5)
+
+    def test_a_declined_internal_error_is_an_empty_answer(self):
+        results, unserved, retryable = self._collect(ErrorVerdict.DECLINED, {"code": -32603, "message": "x"})
+        assert results[1] == [] and unserved == set() and retryable == set()
+
+    def test_a_transient_internal_error_is_asked_again(self):
+        _, unserved, retryable = self._collect(ErrorVerdict.TRANSIENT, {"code": -32603, "message": "x"})
+        assert unserved == {1} and retryable == {1}
+
+    def test_a_failure_stays_unserved(self):
+        _, unserved, retryable = self._collect(ErrorVerdict.FAILURE, {"code": -32603, "message": "x"})
+        assert unserved == {1} and retryable == set()
+
+    def test_a_server_defined_code_is_never_judged(self):
+        """Only a reserved code can mean the request went unserved."""
+        client = LSPClient(["cmd"], Path("/root"), error_verdict=MagicMock(side_effect=AssertionError))
+        client._process = MagicMock()
+        client._process.poll.return_value = None
+        client._msg_queue.put({"jsonrpc": "2.0", "id": 1, "error": {"code": -40000, "message": "no target"}})
+        _, unserved, _ = client._collect_batch_responses("textDocument/definition", [1], timeout=5)
+        assert unserved == set()
+
+    def test_a_transient_error_that_settles_on_the_second_ask_is_served(self):
+        client = LSPClient(["cmd"], Path("/root"), error_verdict=lambda _: ErrorVerdict.TRANSIENT)
+        answers = iter(
+            [
+                [BatchAnswer([], served=False, retryable=True)],
+                [BatchAnswer([{"uri": "file:///root/a.kt"}], served=True, retryable=False)],
+            ]
+        )
+        with patch.object(client, "_send_round", side_effect=lambda *a, **k: next(answers)):
+            results = client.send_definition_batch([(Path("/root/a.kt"), 0, 0)])
+        assert results == [[{"uri": "file:///root/a.kt"}]]

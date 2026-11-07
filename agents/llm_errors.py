@@ -1,0 +1,278 @@
+"""Provider-agnostic LLM failure classification, exceptions, and retry helpers."""
+
+from __future__ import annotations
+
+import email.utils
+import logging
+import re
+import time
+
+from agents.llm_config import CODEBOARDING_KEY_TAIL, current_provider_key_context
+
+logger = logging.getLogger(__name__)
+
+# Process exit code for a rejected key. Distinct from 1 (generic failure) so the
+# OSS CLI and the wrapper subprocess both signal "fix your key" the same way, and
+# callers/CI can branch on it. Lives here (not in main.py) so the wrapper can
+# import it without pulling in Core's whole CLI module.
+EXIT_AUTH_ERROR = 2
+
+# Process exit code for an exhausted token or credit quota: the key is fine, the account is not.
+EXIT_QUOTA_EXHAUSTED = 3
+
+CODEBOARDING_QUOTA_CODE = "free_credits_exhausted"
+# Response contract: licensing-aws/gha_proxy/handler.py.
+PROXY_ERROR_TYPE = "gha_proxy"
+PROXY_QUOTA_MESSAGE = "Resource exhausted: token limit reached"
+
+# Class names, across SDKs, that always mean "credentials were rejected".
+# openai/anthropic/cerebras raise ``AuthenticationError``; google raises
+# ``Unauthenticated``/``PermissionDenied``; Bedrock (botocore) surfaces
+# ``AccessDeniedException``/``UnrecognizedClientException`` in the error text.
+_AUTH_TYPE_NAMES = {
+    "AuthenticationError",
+    "Unauthenticated",
+    "PermissionDeniedError",
+    "AccessDeniedException",
+    "UnrecognizedClientException",
+}
+
+# Substrings in a provider's message that indicate an auth failure even when the
+# status code isn't exposed on the exception (e.g. errors re-wrapped by langchain
+# or botocore, where only the string survives).
+_AUTH_MESSAGE_PATTERNS = (
+    re.compile(r"\b401\b"),
+    re.compile(r"invalid[\s_-]*x?[\s_-]*api[\s_-]*key", re.IGNORECASE),
+    re.compile(r"incorrect api key", re.IGNORECASE),
+    re.compile(r"api key.*invalid", re.IGNORECASE),
+    # Google: "API key not valid" or reason API_KEY_INVALID.
+    re.compile(r"api[\s_]*key[\s_]*(?:not[\s_]*valid|invalid)", re.IGNORECASE),
+    re.compile(r"authentication[\s_]*error", re.IGNORECASE),
+    re.compile(r"authentication fails", re.IGNORECASE),
+    re.compile(r"\bunauthorized\b", re.IGNORECASE),
+    re.compile(r"missing authentication", re.IGNORECASE),
+    re.compile(r"access denied", re.IGNORECASE),
+    re.compile(r"invalid github oidc token", re.IGNORECASE),
+)
+
+
+# Class names, across SDKs, for a request that never got an answer: openai/anthropic/cerebras raise
+# ``APIConnectionError`` (``APITimeoutError`` subclasses it), ollama lets httpx's ``TransportError`` through.
+_TRANSIENT_TYPE_NAMES = {"APIConnectionError", "TransportError", "TimeoutError", "ConnectionError"}
+
+
+# What each provider says when the prompt is over the model's context window: Google, OpenAI, Anthropic.
+_CONTEXT_OVERFLOW_PATTERNS = (
+    re.compile(r"exceeds the maximum number of tokens", re.IGNORECASE),
+    re.compile(r"maximum context length|context_length_exceeded", re.IGNORECASE),
+    re.compile(r"prompt is too long", re.IGNORECASE),
+)
+
+
+class ScopeContextTooLargeError(RuntimeError):
+    """A scope's context does not fit the model's budget even after every trim.
+
+    Why: sent anyway, the provider rejects it with a 400 worded differently by each provider — and
+    OpenRouter's embeds an upstream 401 that used to be read as a rejected key. Stopping before the
+    call names the real limit.
+    """
+
+    def __init__(self, scope_id: str, needed_tokens: int, allowed_tokens: int):
+        super().__init__(
+            f"Scope {scope_id!r} needs about {needed_tokens:,} tokens of context after trimming, over the "
+            f"{allowed_tokens:,} this model allows a scope. Use a model with a larger context window, or "
+            "narrow the analysis with .codeboardingignore."
+        )
+        self.scope_id = scope_id
+        self.needed_tokens = needed_tokens
+        self.allowed_tokens = allowed_tokens
+
+
+class LLMAuthError(RuntimeError):
+    """An LLM provider rejected our credentials (HTTP 401 or equivalent).
+
+    Terminal by construction: the agent retry loop gives up immediately and the
+    CLI surfaces an actionable message instead of a traceback. ``provider`` and
+    ``key_tail`` identify *which* key to fix without leaking the secret.
+
+    ``telemetry_properties`` is forwarded into the PostHog ``$exception`` event
+    (see ``telemetry.events._exception_properties``).
+    """
+
+    def __init__(self, message: str, *, provider: str, key_tail: str, telemetry_properties: dict):
+        super().__init__(message)
+        self.provider = provider
+        self.key_tail = key_tail
+        self.telemetry_properties = telemetry_properties
+
+
+class LLMQuotaError(RuntimeError):
+    """An LLM quota is exhausted, with recovery guidance and failure telemetry."""
+
+    def __init__(self, error: BaseException):
+        self.telemetry_properties = llm_failure_properties(error)
+        self.is_codeboarding_quota = _is_codeboarding_quota(error)
+        _, key_tail = current_provider_key_context()
+        if self.is_codeboarding_quota:
+            message = (
+                "Your CodeBoarding quota is exhausted. "
+                "Buy a CodeBoarding license at https://codeboarding.org/pricing, "
+                "or wait for your weekly reset."
+            )
+        elif key_tail == CODEBOARDING_KEY_TAIL:
+            message = (
+                "The hosted LLM provider's quota is exhausted. "
+                "This is a CodeBoarding service issue. Please try again later or contact CodeBoarding support."
+            )
+        else:
+            message = (
+                "The LLM provider's token or credit quota is exhausted. "
+                "Add credits or raise the quota for this provider, then re-run."
+            )
+        super().__init__(message)
+
+
+def llm_failure_properties(exc: BaseException) -> dict:
+    """Classify a failed LLM call for exception telemetry."""
+    quota = is_quota_exhausted(exc)
+    context = isinstance(exc, ScopeContextTooLargeError) or any(p.search(str(exc)) for p in _CONTEXT_OVERFLOW_PATTERNS)
+    provider, _key_tail = current_provider_key_context()
+    properties = {
+        "error_type": "quota" if quota else "context" if context else "llm",
+        "error_provider": provider,
+        "error_status_code": _status_code(exc),
+        "error_message": str(exc)[:500],
+    }
+    if _is_codeboarding_quota(exc):
+        properties["error_code"] = CODEBOARDING_QUOTA_CODE
+    return properties
+
+
+def is_quota_exhausted(exc: BaseException) -> bool:
+    status = _status_code(exc)
+    quota_code = getattr(exc, "code", None) == "insufficient_quota" or "insufficient_quota" in str(exc)
+    return status == 402 or (status == 429 and quota_code)
+
+
+def _is_codeboarding_quota(exc: BaseException) -> bool:
+    body = getattr(exc, "body", {})
+    error = body.get("error", body) if isinstance(body, dict) else {}
+    return (
+        _status_code(exc) == 402
+        and isinstance(error, dict)
+        and error.get("type") == PROXY_ERROR_TYPE
+        and error.get("message") == PROXY_QUOTA_MESSAGE
+    )
+
+
+def _status_code(exc: BaseException) -> int | None:
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        code = getattr(exc, "code", None)  # google GoogleAPICallError.code
+    if code is None:
+        response = getattr(exc, "response", None)  # botocore ClientError (Bedrock) keeps it in a dict
+        if isinstance(response, dict):
+            code = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    if code is None:
+        return None
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_auth_failure(exc: BaseException) -> bool:
+    """Detect rejected credentials, preferring the response status over embedded upstream errors."""
+    status = _status_code(exc)
+    if status is not None:
+        return status in (401, 403)
+    if type(exc).__name__ in _AUTH_TYPE_NAMES:
+        return True
+    text = str(exc)
+    return any(p.search(text) for p in _AUTH_MESSAGE_PATTERNS)
+
+
+def detect_auth_error(exc: BaseException, *, provider: str, key_tail: str) -> LLMAuthError | None:
+    """Return an :class:`LLMAuthError` if *exc* is an auth failure, else ``None``.
+
+    Already-typed :class:`LLMAuthError` instances pass through unchanged so a
+    re-raise doesn't wrap them twice or lose their original provenance.
+    """
+    if isinstance(exc, LLMAuthError):
+        return exc
+    if not _is_auth_failure(exc):
+        return None
+
+    status = _status_code(exc)
+    provider_message = str(exc)
+    status_note = f" (HTTP {status})" if status is not None else ""
+    if status == 403:
+        # A 403 can refuse one request (a router's moderation, a model the key may not use) while the same key
+        # serves the rest, so the provider's own reason says more than a hint about the key.
+        friendly = f"{provider} refused the request (HTTP 403): {provider_message[:500]}"
+    elif key_tail == CODEBOARDING_KEY_TAIL:
+        friendly = (
+            f"CodeBoarding's hosted {provider} credentials were rejected{status_note}. This run used no key of "
+            "yours: check that the workflow grants `id-token: write`, then re-run."
+        )
+    else:
+        friendly = (
+            f"Your {provider} API key was rejected{status_note}. Verify the key ending in '…{key_tail}' and try again."
+        )
+    telemetry_properties = {
+        "error_type": "auth",
+        "error_provider": provider,
+        "error_status_code": status,
+        "error_key_tail": key_tail,
+        "error_message": provider_message[:500],
+    }
+    return LLMAuthError(
+        friendly,
+        provider=provider,
+        key_tail=key_tail,
+        telemetry_properties=telemetry_properties,
+    )
+
+
+def is_transient_llm_error(exc: BaseException) -> bool:
+    """Whether the same request may succeed if sent again: throttled, a server error, or no answer at all.
+
+    Why: the hosted proxy answers a burst over its concurrency cap with a 429 and a failed upstream call with a
+    502, and one of either used to fail the whole run. A rejected key, a spent quota or a malformed request fails
+    the same way every time.
+    """
+    status = _status_code(exc)
+    if status is not None:
+        return status in (408, 429) and not is_quota_exhausted(exc) or status >= 500
+    return any(cls.__name__ in _TRANSIENT_TYPE_NAMES for cls in type(exc).__mro__)
+
+
+def retry_after_seconds(exc: BaseException) -> float | None:
+    """The wait a provider asked for, when the exception carries the response: ``retry-after-ms``, or
+    ``Retry-After`` as seconds or an HTTP date. None when absent, unreadable or already past."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return None
+    try:
+        return max(0.0, float(headers.get("retry-after-ms", "")) / 1000)
+    except (TypeError, ValueError):
+        pass
+    value = headers.get("retry-after", "")
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        wait = email.utils.parsedate_to_datetime(value).timestamp() - time.time()
+    except (TypeError, ValueError):
+        return None
+    return wait if wait > 0 else None
+
+
+def raise_if_auth_error(exc: Exception) -> None:
+    """Raise a typed terminal error when a provider rejected its credentials."""
+    provider, key_tail = current_provider_key_context()
+    auth_error = detect_auth_error(exc, provider=provider, key_tail=key_tail)
+    if auth_error is not None:
+        logger.error("LLM auth failure — not retrying: %s", auth_error)
+        raise auth_error from exc

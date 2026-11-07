@@ -1,0 +1,551 @@
+"""C# language adapter using csharp-ls (Roslyn-based)."""
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import subprocess
+import threading
+from collections.abc import Sequence
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from xml.etree import ElementTree
+
+from infra.repo_utils.ignore import RepoIgnoreManager
+from static_analyzer.config import Language, NodeType
+from static_analyzer.dotnet_sdk import TOOL_SDK_CHANNEL, DotnetSdkError, resolve_dotnet_sdk, system_dotnet_env
+from static_analyzer.dotnet_solution import analyzer_project_references, solution_projects
+from static_analyzer.engine.language_adapter import LanguageAdapter
+from static_analyzer.engine.lsp_client import LSPClient
+from static_analyzer.engine.source_inspector import SourceInspector
+from static_analyzer.exceptions import WorkspaceSetupError
+from infra.tool_registry import (
+    TOOL_REGISTRY,
+    ToolKind,
+    acquire_lock,
+    get_servers_dir,
+    install_package_manager_tools,
+    package_manager_tool_is_current,
+    package_manager_tool_path,
+)
+
+logger = logging.getLogger(__name__)
+
+_MULTI_TARGET_PROJECT_THRESHOLD = 25
+_DOTNET_TIMEOUT_SECONDS = 600
+_SINGLE_TARGET_FRAMEWORK_TARGETS = r"""<Project>
+  <PropertyGroup Condition="'$(CodeBoardingOriginalDirectoryBuildTargetsPath)' == ''">
+    <CodeBoardingDirectoryBuildTargetsPath>$([MSBuild]::GetPathOfFileAbove('Directory.Build.targets', '$(MSBuildProjectDirectory)'))</CodeBoardingDirectoryBuildTargetsPath>
+  </PropertyGroup>
+  <Import
+    Project="$(CodeBoardingOriginalDirectoryBuildTargetsPath)"
+    Condition="Exists('$(CodeBoardingOriginalDirectoryBuildTargetsPath)')" />
+  <Import
+    Project="$(CodeBoardingDirectoryBuildTargetsPath)"
+    Condition="Exists('$(CodeBoardingDirectoryBuildTargetsPath)')" />
+  <PropertyGroup Condition="'$(TargetFrameworks)' != '' and '$(CodeBoardingFoldMultiTargetFrameworks)' == 'true'">
+    <CodeBoardingTargetFrameworks>$([System.Text.RegularExpressions.Regex]::Replace('$(TargetFrameworks)', '\s', ''))</CodeBoardingTargetFrameworks>
+    <CodeBoardingTargetFrameworks>$([System.Text.RegularExpressions.Regex]::Replace('$(CodeBoardingTargetFrameworks)', ';+', ';'))</CodeBoardingTargetFrameworks>
+    <CodeBoardingTargetFrameworks>;$([System.String]::Copy('$(CodeBoardingTargetFrameworks)').Trim(';'));</CodeBoardingTargetFrameworks>
+    <CodeBoardingPreferredTargetFramework Condition="'$(BundledNETCoreAppTargetFrameworkVersion)' != ''">net$(BundledNETCoreAppTargetFrameworkVersion)</CodeBoardingPreferredTargetFramework>
+    <TargetFrameworks>$([System.String]::Copy('$(CodeBoardingTargetFrameworks)').Trim(';').Split(';')[0])</TargetFrameworks>
+    <TargetFrameworks Condition="'$(CodeBoardingPreferredTargetFramework)' != '' and $(CodeBoardingTargetFrameworks.Contains(';$(CodeBoardingPreferredTargetFramework);'))">$(CodeBoardingPreferredTargetFramework)</TargetFrameworks>
+  </PropertyGroup>
+  <!-- An analyzer whose assembly is absent cannot run, but Roslyn keeps it as an
+       UnresolvedAnalyzerReference whose checksum throws, failing every
+       textDocument/implementation request in the solution. -->
+  <Target Name="CodeBoardingDropMissingAnalyzers" BeforeTargets="CoreCompile">
+    <ItemGroup>
+      <Analyzer Remove="@(Analyzer)" Condition="!Exists('%(Analyzer.FullPath)')" />
+    </ItemGroup>
+  </Target>
+</Project>
+"""
+
+_WORKSPACE_TARGET_FRAMEWORK_PROPS = r"""<Project TreatAsLocalProperty="TargetFramework">
+  <PropertyGroup>
+    <_DirectoryBuildPropsBasePath Condition="'$(_DirectoryBuildPropsBasePath)' == ''">$([MSBuild]::GetDirectoryNameOfFileAbove('$(MSBuildProjectDirectory)', 'Directory.Build.props'))</_DirectoryBuildPropsBasePath>
+    <CodeBoardingWorkspaceTargetFramework>$(TargetFramework)</CodeBoardingWorkspaceTargetFramework>
+    <CodeBoardingDirectoryBuildPropsPath Condition="'$(CodeBoardingOriginalDirectoryBuildPropsPath)' == ''">$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildProjectDirectory)'))</CodeBoardingDirectoryBuildPropsPath>
+  </PropertyGroup>
+  <Import
+    Project="$(CodeBoardingOriginalDirectoryBuildPropsPath)"
+    Condition="Exists('$(CodeBoardingOriginalDirectoryBuildPropsPath)')" />
+  <Import
+    Project="$(CodeBoardingDirectoryBuildPropsPath)"
+    Condition="Exists('$(CodeBoardingDirectoryBuildPropsPath)')" />
+</Project>
+"""
+
+
+def _write_injected_import(name: str, content: str) -> Path:
+    """Materialize an MSBuild import CodeBoarding injects via environment variable."""
+    path = get_servers_dir() / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() or path.read_text(encoding="utf-8") != content:
+        # Per thread, not just per process: several engines can publish these
+        # concurrently, and a shared temp name loses the race to os.replace.
+        temporary_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        temporary_path.write_text(content, encoding="utf-8")
+        os.replace(temporary_path, path)
+    return path
+
+
+def _single_target_framework_env(project_root: Path) -> dict[str, str]:
+    """Keep csharp-ls's workspace-wide TargetFramework from rewriting single-target projects.
+
+    Why: csharp-ls folds every project's frameworks into one global MSBuild
+    ``TargetFramework``. A global property outranks a project's own
+    ``<TargetFramework>``, so a solution whose projects do not all share one
+    framework has that property forced onto the odd ones out. Conditions keyed
+    on ``$(TargetFramework)`` then evaluate against a framework the project does
+    not target -- the idiomatic ``Condition="'$(TargetFramework)' !=
+    'netstandard2.0'"`` guard around analyzer ``ProjectReference`` items inverts
+    and the analyzer projects reference themselves, which sends Roslyn's
+    solution load into unbounded growth. ``TreatAsLocalProperty`` demotes the
+    property so each project sees its declared framework again. Roslyn retains
+    its normal inner-build expansion for projects that genuinely multi-target.
+
+    Why the base path: ``UseArtifactsOutput`` derives its ``artifacts`` root from
+    ``_DirectoryBuildPropsBasePath``, which the SDK computes only when it found
+    ``Directory.Build.props`` itself rather than being handed a path.
+
+    Folding a multi-target project down to a single framework stays behind
+    ``_MULTI_TARGET_PROJECT_THRESHOLD``, because that fold discards frameworks a
+    small solution may want analyzed. Demoting the property has no such cost: it
+    only changes evaluation for a project whose declared framework the workspace
+    value contradicts, so it applies to every solution.
+    """
+    targets_path = _write_injected_import("csharp-ls-single-target.targets", _SINGLE_TARGET_FRAMEWORK_TARGETS)
+    props_path = _write_injected_import("csharp-ls-workspace-tfm.props", _WORKSPACE_TARGET_FRAMEWORK_PROPS)
+
+    env = {"DirectoryBuildTargetsPath": str(targets_path), "DirectoryBuildPropsPath": str(props_path)}
+
+    project_count = sum(1 for pattern in ("*.csproj", "*.fsproj") for _ in project_root.rglob(pattern))
+    if project_count > _MULTI_TARGET_PROJECT_THRESHOLD:
+        env["CodeBoardingFoldMultiTargetFrameworks"] = "true"
+
+    original_targets_path = os.environ.get("DirectoryBuildTargetsPath")
+    if original_targets_path:
+        env["CodeBoardingOriginalDirectoryBuildTargetsPath"] = original_targets_path
+    original_props_path = os.environ.get("DirectoryBuildPropsPath")
+    if original_props_path:
+        env["CodeBoardingOriginalDirectoryBuildPropsPath"] = original_props_path
+    return env
+
+
+class CSharpAdapter(LanguageAdapter):
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Files declaring more than one top-level type, keyed by (project root, path). Why:
+        # the file stem names a single type or none, and only these files need it kept as a
+        # segment. Why the root: this one adapter serves every C# engine config, which the
+        # bounded pass can run concurrently, and two roots can hold the same file.
+        self._files_with_sibling_types: set[tuple[str, str]] = set()
+        self._standalone_workspaces: dict[Path, TemporaryDirectory[str]] = {}
+
+    def workspace_folders(self, project_root: Path, source_files: Sequence[Path]) -> list[Path]:
+        """Supply an isolated project for sources with no declared .NET project."""
+        ignore_manager = RepoIgnoreManager(project_root)
+        if not source_files or any(
+            not ignore_manager.should_ignore(path)
+            for pattern in ("*.sln", "*.slnx", "*.csproj", "*.fsproj")
+            for path in project_root.rglob(pattern)
+            if path.is_file()
+        ):
+            if temporary := self._standalone_workspaces.pop(project_root, None):
+                temporary.cleanup()
+            return []
+
+        temporary = self._standalone_workspaces.get(project_root)
+        if temporary is None:
+            temporary = TemporaryDirectory(prefix="codeboarding-csharp-")
+            self._standalone_workspaces[project_root] = temporary
+        workspace = Path(temporary.name).resolve()
+        project = ElementTree.Element("Project", Sdk="Microsoft.NET.Sdk")
+        properties = ElementTree.SubElement(project, "PropertyGroup")
+        for name, value in {
+            "TargetFramework": f"net{TOOL_SDK_CHANNEL}",
+            "EnableDefaultCompileItems": "false",
+            "GenerateAssemblyInfo": "false",
+            "GenerateTargetFrameworkAttribute": "false",
+        }.items():
+            ElementTree.SubElement(properties, name).text = value
+        items = ElementTree.SubElement(project, "ItemGroup")
+        for source in source_files:
+            # MSBuild interprets these characters even after XML attribute escaping.
+            include = str(source.resolve())
+            for character in ("%", "$", "@", "'", ";", "?", "*"):
+                include = include.replace(character, f"%{ord(character):02X}")
+            ElementTree.SubElement(items, "Compile", Include=include)
+        # Stop both MSBuild and our injected imports from searching temporary-directory ancestors.
+        for name in ("Directory.Build.props", "Directory.Build.targets"):
+            (workspace / name).write_text("<Project />", encoding="utf-8")
+        target = workspace / "Standalone.csproj"
+        ElementTree.ElementTree(project).write(target, encoding="utf-8", xml_declaration=True)
+        solution = ElementTree.Element("Solution")
+        ElementTree.SubElement(solution, "Project", Path=target.name)
+        ElementTree.ElementTree(solution).write(workspace / "Standalone.slnx", encoding="utf-8", xml_declaration=True)
+
+        logger.warning(
+            "C# sources in %s have no project or solution; using a temporary analysis project targeting net%s. "
+            "Framework, dependencies and compiler options are inferred and may differ from the actual build.",
+            project_root,
+            TOOL_SDK_CHANNEL,
+        )
+        try:
+            resolution = resolve_dotnet_sdk(workspace)
+        except DotnetSdkError as exc:
+            raise WorkspaceSetupError(f"Could not resolve the SDK for standalone C# in {project_root}") from exc
+        env = {**os.environ, **resolution.env, **_single_target_framework_env(workspace)}
+        if not self._dotnet("restore", resolution.dotnet_path, target, workspace, env):
+            raise WorkspaceSetupError(f"Could not restore the standalone C# analysis project for {project_root}")
+        # Definition requests are routed by URI prefix, even for linked source files.
+        return [project_root]
+
+    def record_document_symbols(self, file_path: Path, symbols: list[dict], project_root: Path) -> None:
+        # Discarded as well as added: the same adapter can re-analyse a file after a sibling
+        # was deleted, and it must then name it the way a cold run would.
+        key = (str(project_root), str(file_path))
+        if len(self._top_level_types(symbols)) > 1:
+            self._files_with_sibling_types.add(key)
+        else:
+            self._files_with_sibling_types.discard(key)
+
+    def read_document_symbols(self, file_path: Path, inspector: SourceInspector, client: LSPClient) -> list[dict]:
+        """csharp-ls answers nothing for a file that is in more than one project (a
+        shared source linked into several); the parse tree names its members instead.
+
+        Why the workspace query: the server answers nothing for a file outside its
+        solution too, and that one it can still serve once opened. Only a file the
+        loaded solution declares types in is a linked file.
+        """
+        symbols = inspector.find_document_symbols(file_path)
+        declared = self._top_level_types(symbols)
+        if not declared:
+            return []
+        query = declared[0].split("<", 1)[0]
+        uri = file_path.resolve().as_uri()
+        if any(hit.get("location", {}).get("uri") == uri for hit in client.workspace_symbol(query)):
+            return symbols
+        return []
+
+    @property
+    def language(self) -> str:
+        return "CSharp"
+
+    @property
+    def language_enum(self) -> Language:
+        return Language.CSHARP
+
+    @property
+    def lsp_command(self) -> list[str]:
+        return ["csharp-ls"]
+
+    @property
+    def language_id(self) -> str:
+        return "csharp"
+
+    def get_lsp_command(self, project_root: Path) -> list[str]:
+        """Resolve the .NET SDK and ensure the managed csharp-ls install is current."""
+        if workspace := self._standalone_workspaces.get(project_root):
+            project_root = Path(workspace.name)
+        try:
+            resolution = resolve_dotnet_sdk(project_root)
+        except DotnetSdkError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        self._ensure_csharp_ls_installed(project_root, resolution.dotnet_path, resolution.env)
+        command = super().get_lsp_command(project_root)
+        if workspace:
+            command.extend(["--solution", str(Path(workspace.name) / "Standalone.slnx")])
+        return command
+
+    def _ensure_csharp_ls_installed(self, project_root: Path, dotnet_path: str, dotnet_env: dict[str, str]) -> None:
+        dep = next((d for d in TOOL_REGISTRY if d.key == "csharp" and d.kind is ToolKind.PACKAGE_MANAGER), None)
+        if dep is None:
+            return
+
+        servers_dir = get_servers_dir()
+        managed_path = package_manager_tool_path(servers_dir, dep)
+        if managed_path is not None and package_manager_tool_is_current(servers_dir, dep):
+            return
+
+        command = super().get_lsp_command(project_root)
+        if managed_path is None and command and shutil.which(command[0]):
+            return
+
+        servers_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = servers_dir / ".download.lock"
+        env = os.environ.copy()
+        env.update(dotnet_env)
+        with open(lock_path, "w") as lock_fd:
+            acquire_lock(lock_fd)
+            if package_manager_tool_is_current(servers_dir, dep):
+                return
+            install_package_manager_tools(
+                servers_dir,
+                [dep],
+                manager_overrides={"dotnet": dotnet_path},
+                env=env,
+            )
+        if not package_manager_tool_is_current(servers_dir, dep):
+            raise RuntimeError(
+                "csharp-ls could not be installed. CodeBoarding needs csharp-ls 0.24.0 and a .NET 10 SDK "
+                "to analyze C# projects."
+            )
+
+    def build_qualified_name(
+        self,
+        file_path: Path,
+        symbol_name: str,
+        symbol_kind: int,
+        parent_chain: list[tuple[str, int]],
+        project_root: Path,
+        detail: str = "",
+    ) -> str:
+        """Build ``<directories>.<file stem>.<declaring types>.<symbol>``, from the repository root.
+
+        C# has no file scope, so a file may declare several top-level types. The stem then
+        names none of them and stays a plain segment. Folding it in, as a file declaring one
+        type can, would give a sibling the same name as a type nested inside the one the
+        file is named after -- and the two would overwrite each other.
+        """
+        # The namespace symbol itself is the only one csharp-ls gives the full name to.
+        if detail and symbol_kind == NodeType.NAMESPACE:
+            return detail
+
+        rel = file_path.relative_to(project_root)
+        module = ".".join(rel.with_suffix("").parts)
+        # Skip File and Namespace: the namespace is encoded in the path for C#.
+        code_parents = [name for name, kind in parent_chain if kind not in (NodeType.FILE, NodeType.NAMESPACE)]
+
+        if (str(project_root), str(file_path)) not in self._files_with_sibling_types:
+            if code_parents and code_parents[0] == rel.stem:
+                code_parents = code_parents[1:]
+            if not code_parents and symbol_name == rel.stem:
+                return module
+        return ".".join((module, *code_parents, symbol_name))
+
+    def extract_package(self, qualified_name: str) -> str:
+        """Extract namespace as all-but-last-two dot-separated components.
+
+        For ``Services.Auth.AuthService.Login`` the package is ``Services.Auth``.
+        """
+        return self._extract_deep_package(qualified_name)
+
+    def get_lsp_init_options(self, ignore_manager: RepoIgnoreManager | None = None) -> dict:
+        """Configure csharp-ls for static analysis.
+
+        Settings are read from the ``csharp`` workspace configuration section.
+        """
+        return {
+            "csharp": {
+                "logLevel": "warning",
+            },
+        }
+
+    def get_workspace_settings(self) -> dict | None:
+        return {
+            "csharp": {
+                "logLevel": "warning",
+            },
+        }
+
+    @property
+    def probe_before_open(self) -> bool:
+        """csharp-ls loads all files from the .sln — didOpen before workspace load kills it."""
+        return True
+
+    @property
+    def workspace_owns_documents(self) -> bool:
+        """csharp-ls answers position queries from the loaded solution, opened or not."""
+        return True
+
+    @property
+    def expands_virtual_dispatch(self) -> bool:
+        """csharp-ls answers ``textDocument/implementation`` for interface members
+        but returns nothing for abstract or virtual *class* members, so a call
+        through a base-typed reference stops at the abstract declaration."""
+        return True
+
+    @property
+    def resolves_collection_initializers(self) -> bool:
+        """C# collection-initializer braces desugar to Add calls."""
+        return True
+
+    @property
+    def resolves_iterated_types(self) -> bool:
+        """csharp-ls answers typeDefinition, so a ``foreach`` over a repo
+        collection can name the type it enumerates."""
+        return True
+
+    def get_lsp_default_timeout(self) -> int:
+        """csharp-ls needs extra time to load Roslyn workspace for large solutions."""
+        return 120
+
+    def get_probe_timeout_minimum(self) -> int:
+        """Roslyn workspace loading for large .NET solutions can exceed 5 minutes."""
+        return 600
+
+    def wait_for_diagnostics(self, client: LSPClient) -> None:
+        """csharp-ls publishes diagnostics asynchronously after didOpen with
+        no enclosing readiness signal — no ``$/progress`` end, no
+        ``language/status``, just a burst of ``publishDiagnostics`` and
+        then silence. The only correct synchronization is to debounce on
+        the publishDiagnostics stream itself.
+
+        Empirically 2s idle / 30s max covers both the edge-case fixture
+        (8 files, ~1s of publishes) and large repos like Polly (~500 files,
+        several seconds of publishes).
+        """
+        client.wait_for_diagnostics_quiesce(idle_seconds=2.0, max_wait=30.0)
+
+    def prepare_project(self, project_root: Path) -> None:
+        """Run ``dotnet restore``, then build any analyzer projects, so csharp-ls can
+        resolve framework references and analyzer assemblies.
+
+        Why: csharp-ls relies on Roslyn / MSBuild to load the project, and
+        MSBuild needs ``obj/project.assets.json`` (produced by restore) to
+        find the .NET runtime reference assemblies. Without it, csharp-ls
+        emits a flood of bogus ``CS0518: Predefined type System.X is not
+        defined`` diagnostics for every file. Restore is idempotent and only writes
+        under ``obj/``; building an analyzer project also writes its ``bin/``.
+
+        Restore runs under the MSBuild environment csharp-ls gets, so the two
+        evaluate every path the same way and the server finds what restore wrote.
+        """
+        # Find solution or csproj/fsproj at the project_root level
+        target = next(iter(project_root.glob("*.sln")), None)
+        if target is None:
+            target = next(iter(project_root.glob("*.slnx")), None)
+        if target is None:
+            target = next(iter(project_root.glob("*.csproj")), None)
+        if target is None:
+            target = next(iter(project_root.glob("*.fsproj")), None)
+        if target is None:
+            logger.debug("No solution/project file found at %s; skipping restore", project_root)
+            return
+
+        try:
+            resolution = resolve_dotnet_sdk(project_root)
+        except DotnetSdkError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        env = os.environ.copy()
+        env.update(self.get_lsp_env(project_root))
+        if target.suffix not in (".sln", ".slnx"):
+            self._dotnet("restore", resolution.dotnet_path, target, project_root, env)
+            self._build_analyzers(resolution.dotnet_path, [target], project_root, env)
+            return
+        if self._dotnet("restore", resolution.dotnet_path, target, project_root, env):
+            self._build_analyzers(resolution.dotnet_path, solution_projects(target), project_root, env)
+            return
+        # A solution restore evaluates every project before writing any assets, so one
+        # project it cannot evaluate (a missing workload, a broken import) leaves the
+        # rest without ``project.assets.json`` -- and csharp-ls then resolves no package
+        # or transitive project reference anywhere. Each member on its own only fails
+        # for itself.
+        projects = solution_projects(target)
+        restored = sum(
+            self._dotnet("restore", resolution.dotnet_path, project, project_root, env) for project in projects
+        )
+        logger.info("dotnet restore per project: %d of %d restored", restored, len(projects))
+        self._build_analyzers(resolution.dotnet_path, projects, project_root, env)
+
+    def get_lsp_env(self, project_root: Path | None = None, source_files: Sequence[Path] = ()) -> dict[str, str]:
+        """Return the .NET environment needed by csharp-ls.
+
+        With a project root, this may point at CodeBoarding's private SDK
+        hive. Without one, preserve the branch's legacy Homebrew/system
+        DOTNET_ROOT and DOTNET_ROLL_FORWARD behavior for older callers.
+        """
+        if project_root is not None:
+            if workspace := self._standalone_workspaces.get(project_root):
+                project_root = Path(workspace.name)
+            try:
+                env = resolve_dotnet_sdk(project_root).env
+            except DotnetSdkError as exc:
+                raise RuntimeError(str(exc)) from exc
+            env.update(_single_target_framework_env(project_root))
+            return env
+        dotnet = shutil.which("dotnet")
+        env = system_dotnet_env(Path(dotnet)) if dotnet else {}
+        if not os.environ.get("DOTNET_ROLL_FORWARD"):
+            env["DOTNET_ROLL_FORWARD"] = "Major"
+        return env
+
+    @property
+    def fail_on_empty_symbols(self) -> bool:
+        return True
+
+    @property
+    def reports_enum_members_as_fields(self) -> bool:
+        return True
+
+    def is_reference_worthy(self, symbol_kind: int) -> bool:
+        """Include namespaces in reference tracking (similar to PHP modules)."""
+        return super().is_reference_worthy(symbol_kind) or symbol_kind == NodeType.NAMESPACE
+
+    def get_all_packages(self, source_files: list[Path], project_root: Path) -> set[str]:
+        """Get all directory prefixes as packages (namespace-based, like PHP)."""
+        return self._get_hierarchical_packages(source_files, project_root)
+
+    def _top_level_types(self, symbols: list[dict]) -> list[str]:
+        """The type declarations a file makes outside any other type."""
+        found: list[str] = []
+        for sym in symbols:
+            kind = sym.get("kind", 0)
+            if kind in (NodeType.FILE, NodeType.NAMESPACE):
+                found.extend(self._top_level_types(sym.get("children", [])))
+            elif self.is_class_like(kind):
+                found.append(sym.get("name", ""))
+        return found
+
+    def _build_analyzers(self, dotnet_path: str, projects: list[Path], project_root: Path, env: dict[str, str]) -> None:
+        """Build the projects referenced as analyzers so Roslyn can resolve them.
+
+        Why: restore does not produce an output assembly, so Roslyn holds an
+        ``UnresolvedAnalyzerReference`` whose checksum throws, failing every
+        ``textDocument/implementation`` request across the whole solution.
+        """
+        analyzers = analyzer_project_references(projects)
+        if not analyzers:
+            return
+        built = sum(self._dotnet("build", dotnet_path, analyzer, project_root, env) for analyzer in analyzers)
+        if built < len(analyzers):
+            # The injected target drops what stays missing, so analysis continues without
+            # the symbols that generator would have produced.
+            logger.warning("dotnet build analyzer projects: only %d of %d built", built, len(analyzers))
+        else:
+            logger.info("dotnet build analyzer projects: %d of %d built", built, len(analyzers))
+
+    def _dotnet(self, verb: str, dotnet_path: str, target: Path, project_root: Path, env: dict[str, str]) -> bool:
+        try:
+            result = subprocess.run(
+                [dotnet_path, verb, os.path.relpath(target, project_root), "--nologo", "--verbosity", "minimal"],
+                cwd=str(project_root),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=_DOTNET_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("dotnet %s timed out after %ds for %s", verb, _DOTNET_TIMEOUT_SECONDS, target.name)
+            return False
+        except OSError as exc:
+            logger.warning("dotnet %s could not be invoked: %s", verb, exc)
+            return False
+        if result.returncode != 0:
+            logger.warning(
+                "dotnet %s failed for %s (exit %d): %s",
+                verb,
+                target.name,
+                result.returncode,
+                (result.stderr or result.stdout)[-500:],
+            )
+            return False
+        logger.info("dotnet %s completed for %s", verb, target.name)
+        return True

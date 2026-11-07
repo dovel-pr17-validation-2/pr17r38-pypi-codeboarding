@@ -1,0 +1,1184 @@
+"""Synchronous LSP client using JSON-RPC over stdio.
+
+Enhanced with diagnostics collection and server-ready wait support
+for CodeBoarding integration.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import queue
+import subprocess
+import threading
+import time
+from collections import OrderedDict, deque
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+
+from static_analyzer.config import LANGUAGE_ID_BY_SUFFIX
+from static_analyzer.engine.lsp_constants import REQUEST_BATCH_SIZE
+from static_analyzer.engine.process_memory import format_bytes, process_tree_rss
+from static_analyzer.engine.utils import uri_to_path
+from static_analyzer.exceptions import LanguageServerStalledError, StaticAnalysisFatalError, WorkspaceSetupError
+from static_analyzer.lsp_client.diagnostics import FileDiagnosticsMap, LSPDiagnostic
+
+logger = logging.getLogger(__name__)
+
+LSP_MEMORY_SAMPLE_INTERVAL_SECONDS = 30
+LSP_STDERR_TAIL_LINES = 32
+# JSON AST nodes retain more Python objects than tree-sitter's native nodes.
+LSP_AST_NODE_BUDGET = 50_000
+LSP_METHOD_NOT_FOUND = -32601
+# Codes LSP (-32899..-32800) and JSON-RPC (-32768..-32000) reserve for a request that went unserved;
+# any other code is the server declining for itself, as gopls does for a free function.
+LSP_RESERVED_ERROR_CODE_RANGES = ((-32899, -32800), (-32768, -32000))
+# Call edges are built from this request, so a server without it cannot produce a graph.
+LSP_REQUIRED_METHODS = frozenset({"textDocument/definition"})
+# RequestCancelled, ContentModified, ServerCancelled: the protocol's remedy is to ask again.
+# Why: rust-analyzer answers ContentModified while it is still indexing an opened file.
+LSP_RETRYABLE_ERROR_CODES = frozenset({-32800, -32801, -32802})
+ProgressToken = str | int
+
+
+def _progress_indicates_failure(message: str) -> bool:
+    message_lower = message.lower()
+    return "failed" in message_lower or "failure" in message_lower or "error" in message_lower
+
+
+def _progress_token(value: object) -> ProgressToken | None:
+    """Return a valid LSP work-done progress token."""
+    if isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool)):
+        return value
+    return None
+
+
+class ErrorVerdict(StrEnum):
+    """What an error response with a reserved code means for the request it answers."""
+
+    FAILURE = "failure"
+    """The request went unserved."""
+    DECLINED = "declined"
+    """The server's answer: nothing in the repository is there."""
+    TRANSIENT = "transient"
+    """The request went unserved this time; asking again is the remedy."""
+
+
+class MethodNotFoundError(Exception):
+    """Raised when the LSP server does not support a requested method."""
+
+
+@dataclass(frozen=True)
+class BatchAnswer:
+    """One query's answer: what came back, whether it was served, and whether to ask again."""
+
+    results: list[dict]
+    served: bool
+    retryable: bool
+
+
+def _is_protocol_failure(error: object) -> bool:
+    """Whether an error response means the request went unserved; "method not found" is an answer."""
+    if not isinstance(error, dict):
+        return False
+    code = error.get("code")
+    if not isinstance(code, int) or code == LSP_METHOD_NOT_FOUND:
+        return False
+    return any(low <= code <= high for low, high in LSP_RESERVED_ERROR_CODE_RANGES)
+
+
+def _is_retryable(error: object) -> bool:
+    """Whether the protocol's own remedy for this failure is to ask again."""
+    return isinstance(error, dict) and error.get("code") in LSP_RETRYABLE_ERROR_CODES
+
+
+class LSPClient:
+    """A synchronous Language Server Protocol client communicating over stdio.
+
+    Uses a background thread to read LSP messages from stdout, so that
+    response reading never blocks on IO — it only blocks on a queue with a timeout.
+
+    Enhanced features:
+    - Collects textDocument/publishDiagnostics notifications
+    - Tracks language/status notifications for JDTLS import-wait
+    """
+
+    def __init__(
+        self,
+        command: list[str],
+        project_root: Path,
+        init_options: dict | None = None,
+        default_timeout: int = 60,
+        startup_timeout: int = 60,
+        collect_diagnostics: bool = False,
+        extra_env: dict[str, str] | None = None,
+        workspace_settings: dict | None = None,
+        extra_client_capabilities: dict | None = None,
+        error_verdict: Callable[[dict], ErrorVerdict] | None = None,
+        workspace_folders: list[Path] | None = None,
+        commands: list[dict] | None = None,
+    ) -> None:
+        self._command = command
+        self._project_root = project_root
+        self._init_options = init_options or {}
+        self._default_timeout = default_timeout
+        # Bounds ``initialize`` only, which some servers hold until the project's build is imported.
+        self._startup_timeout = startup_timeout
+        self._collect_diagnostics = collect_diagnostics
+        self._extra_env = extra_env or {}
+        self._workspace_settings = workspace_settings
+        # Adapter-specific keys merged into capabilities at ``initialize`` time.
+        self._extra_client_capabilities = extra_client_capabilities or {}
+        # How this server's internal errors read; every one is a failure by default.
+        self._error_verdict = error_verdict
+        # Announced in place of the project folder, for a server handed a workspace described apart from it.
+        self._workspace_folders = workspace_folders or []
+        self._commands = commands or []
+        self._process: subprocess.Popen | None = None  # type: ignore[type-arg]
+        self._stdout_fd: int | None = None
+        self._request_id = 0
+        self._msg_queue: queue.Queue[dict] = queue.Queue()
+        self._reader_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=LSP_STDERR_TAIL_LINES)
+        self._peak_rss = 0
+        self._last_memory_sample = 0.0
+        self._shutdown_event = threading.Event()
+        self._write_lock = threading.Lock()
+
+        # Track opened documents and their version counters.
+        self._opened_uris: set[str] = set()
+        self._doc_versions: dict[str, int] = {}
+        self._ast_cache: OrderedDict[str, tuple[dict, int]] = OrderedDict()
+
+        # Diagnostics collection
+        self._diagnostics: FileDiagnosticsMap = {}
+        self._diagnostics_lock = threading.Lock()
+        self._diagnostics_generation: int = 0
+
+        # JDTLS import tracking
+        self._server_ready = threading.Event()
+        self._server_health: str | None = None
+        self._server_health_message: str | None = None
+        self._work_done_progress_titles: dict[ProgressToken, str] = {}
+        self._work_done_progress_failures: set[ProgressToken] = set()
+        # Set when ``initialize`` returned an error response. ``wait_for_server_ready``
+        # bails out immediately when this is set so callers don't burn 5 minutes
+        # waiting on an LSP that already reported a fatal startup error
+        # (e.g. csharp-ls failing to locate the .NET SDK).
+        self._init_failed: bool = False
+        # What the server's ``initialize`` answer offers. Why kept: a request it does not offer can come
+        # back as a generic internal error, which reads as a failure rather than "nothing here".
+        self._server_capabilities: dict = {}
+        # kotlin-lsp reports its build import through ``intellij/workspaceImportState``.
+        self.import_finished = threading.Event()
+        self.import_phase = ""
+        self.import_failed = False
+        # Each workspace folder's import status as the server last reported it, e.g. ``BLOCKED``.
+        self.import_folder_statuses: list[str] = []
+        # Set once the server reports that the backend it fronts died; it never recovers from that.
+        self.server_failure = ""
+
+    def __enter__(self) -> LSPClient:
+        self.start()
+        return self
+
+    def __exit__(self, _exc_type: type | None, _exc_val: Exception | None, _exc_tb: object | None) -> None:
+        self.shutdown()
+
+    def start(self) -> dict | list | None:
+        """Start the LSP server process and perform initialization handshake."""
+        env = os.environ.copy()
+        env.update(self._extra_env)
+        try:
+            self._process = subprocess.Popen(
+                self._command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                cwd=str(self._project_root),
+            )
+        except PermissionError as exc:
+            binary = self._command[0] if self._command else "<lsp>"
+            raise PermissionError(
+                f"LSP server binary is not executable: {binary}. Restart to reinstall, "
+                f"run 'chmod +x {binary}', or check that its directory is not mounted noexec."
+            ) from exc
+
+        # Grab raw fd and close Python's BufferedReader immediately
+        self._stdout_fd = os.dup(self._process.stdout.fileno())  # type: ignore[union-attr]
+        self._process.stdout.close()  # type: ignore[union-attr]
+        self._process.stdout = None  # type: ignore[assignment]
+
+        # Start background reader
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+        self._stderr_tail.clear()
+        self._peak_rss = 0
+        self._last_memory_sample = 0.0
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread.start()
+
+        root_uri = self._project_root.as_uri()
+
+        text_doc_capabilities: dict = {
+            "documentSymbol": {
+                "hierarchicalDocumentSymbolSupport": True,
+            },
+            "references": {},
+            # Why linkSupport: a plain Location may carry the whole declaration's range, starting at
+            # its modifiers; a LocationLink's selection range starts at the name symbols are keyed on.
+            "definition": {"linkSupport": True},
+            "typeHierarchy": {},
+            "implementation": {},
+            "callHierarchy": {},
+        }
+        if self._collect_diagnostics:
+            text_doc_capabilities["publishDiagnostics"] = {
+                "relatedInformation": True,
+                "versionSupport": True,
+                "tagSupport": {"valueSet": [1, 2]},
+            }
+
+        capabilities: dict = {
+            "textDocument": text_doc_capabilities,
+            "window": {"workDoneProgress": True},
+        }
+        # Shallow-merge adapter extras into the top-level capabilities. On
+        # collision: dicts merge, scalars are overwritten by the adapter.
+        for cap_key, cap_value in self._extra_client_capabilities.items():
+            if cap_key in capabilities and isinstance(capabilities[cap_key], dict) and isinstance(cap_value, dict):
+                capabilities[cap_key] = {**capabilities[cap_key], **cap_value}
+            else:
+                capabilities[cap_key] = cap_value
+
+        init_result = self._send_request(
+            "initialize",
+            {
+                "processId": os.getpid(),
+                "rootUri": root_uri,
+                "rootPath": str(self._project_root),
+                "capabilities": capabilities,
+                "workspaceFolders": [
+                    {"uri": folder.as_uri(), "name": folder.name}
+                    for folder in self._workspace_folders or [self._project_root]
+                ],
+                "initializationOptions": self._init_options,
+            },
+            timeout=self._startup_timeout,
+        )
+
+        if isinstance(init_result, dict):
+            self._server_capabilities = init_result.get("capabilities") or {}
+        self._send_notification("initialized", {})
+        for command in self._commands:
+            self._send_request("workspace/executeCommand", command, timeout=self._default_timeout, required=True)
+
+        # LSP servers receive configuration through three mechanisms:
+        #   1. initializationOptions  — sent in the initialize request above.
+        #   2. workspace/didChangeConfiguration — push notification from client.
+        #   3. workspace/configuration — pull request initiated by the server
+        #      (handled in _handle_server_request).
+        #
+        # Many servers only act on (2) or (3) and silently ignore (1) for
+        # certain settings.  For example, Pyright needs
+        # diagnosticSeverityOverrides via (2) to emit diagnostic codes in
+        # publishDiagnostics, and gopls fetches analyzer config via (3).
+        # We therefore deliver workspace_settings through both (2) and (3)
+        # to ensure every server picks them up regardless of which
+        # mechanism it prefers.
+        if self._workspace_settings:
+            self._send_notification(
+                "workspace/didChangeConfiguration",
+                {"settings": self._workspace_settings},
+            )
+
+        return init_result
+
+    def shutdown(self) -> None:
+        """Send shutdown request and exit notification, then terminate process."""
+        self._shutdown_event.set()
+        if self._process and self._process.poll() is None:
+            try:
+                self._send_request("shutdown", None, timeout=5)
+                self._send_notification("exit", None)
+            except Exception:
+                pass
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._process.kill()
+                    self._process.wait(timeout=2)
+                except Exception:
+                    pass
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=2)
+        if self._stderr_thread and self._stderr_thread.is_alive():
+            self._stderr_thread.join(timeout=2)
+        if self._process and self._process.stderr and not (self._stderr_thread and self._stderr_thread.is_alive()):
+            self._process.stderr.close()
+        if self._stdout_fd is not None:
+            try:
+                os.close(self._stdout_fd)
+            except OSError:
+                pass
+            self._stdout_fd = None
+        self._opened_uris.clear()
+        self._doc_versions.clear()
+        self._ast_cache.clear()
+
+    def restart(self) -> None:
+        """Replace the server process with a fresh one, same configuration.
+
+        Used to release memory a server accumulated and will not give back (see
+        ``LSPRecycler``). Diagnostics already collected are kept — they describe
+        the source, not the process. Open-document state is not: the new server
+        has nothing open, so only callers whose server reads documents from the
+        project itself may restart mid-analysis. Readiness is the caller's to
+        re-establish; this client has no view of what ready means per server.
+        """
+        self.shutdown()
+        self._shutdown_event.clear()
+        self._server_ready.clear()
+        self._server_health = None
+        self._server_health_message = None
+        self._work_done_progress_titles.clear()
+        self._work_done_progress_failures.clear()
+        self._init_failed = False
+        self.server_failure = ""
+        # Drop responses the dead server never got to be asked about, so a
+        # stale id cannot satisfy a pending request on the new connection.
+        self._msg_queue = queue.Queue()
+        self.start()
+
+    @property
+    def pid(self) -> int | None:
+        """OS pid of the running server process, or None when it is not running."""
+        if self._process is None or self._process.poll() is not None:
+            return None
+        return self._process.pid
+
+    @property
+    def alive(self) -> bool:
+        """Whether the server process runs and still has the backend that answers for it."""
+        return self.pid is not None and not self.server_failure
+
+    def check_alive(self) -> None:
+        """Raise if the server process exited or reported that its backend died."""
+        if self.server_failure:
+            raise LanguageServerStalledError(
+                f"The language server lost its backend ({self.server_failure}), most often to running out of "
+                "memory; every later answer would read as empty, so the analysis stops here."
+            )
+        if self.pid is None:
+            self._raise_process_exited()
+
+    # ---- Document management ----
+
+    def did_open(self, file_path: Path) -> None:
+        """Notify the server that a document was opened.
+
+        The languageId follows the file's suffix, not the adapter: one server can serve
+        several dialects, and tsserver mis-parses a .tsx opened as plain "typescript".
+
+        Idempotent: silently skips if the file is already open, since the
+        LSP spec forbids duplicate didOpen notifications for the same URI.
+        """
+        uri = file_path.resolve().as_uri()
+        if uri in self._opened_uris:
+            return
+        language_id = LANGUAGE_ID_BY_SUFFIX.get(file_path.suffix)
+        if language_id is None:
+            raise ValueError(f"No LSP language id for suffix {file_path.suffix!r}: {file_path}")
+        try:
+            # Why the encoding is named: the locale's is cp1252 on Windows, which shifts every
+            # column after a non-ASCII character away from the one tree-sitter reports.
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            text = ""
+        self._send_notification(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": text,
+                },
+            },
+        )
+        self._opened_uris.add(uri)
+        self._doc_versions[uri] = 1
+
+    def did_change(self, file_path: Path, content: str) -> None:
+        """Notify the server that a document's content has changed."""
+        # A changed header can alter ASTs of other open translation units.
+        self._ast_cache.clear()
+        uri = file_path.resolve().as_uri()
+        version = self._doc_versions.get(uri, 1) + 1
+        self._doc_versions[uri] = version
+        self._send_notification(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": uri, "version": version},
+                "contentChanges": [{"text": content}],
+            },
+        )
+
+    def did_close(self, file_path: Path) -> None:
+        """Notify the server that a document was closed."""
+        self._ast_cache.clear()
+        uri = file_path.resolve().as_uri()
+        self._send_notification(
+            "textDocument/didClose",
+            {"textDocument": {"uri": uri}},
+        )
+        self._opened_uris.discard(uri)
+        self._doc_versions.pop(uri, None)
+
+    # ---- LSP queries ----
+
+    def symbol_info_batch(self, queries: list[tuple[Path, int, int]]) -> list[list[dict]]:
+        """Read clangd's compiler identities and declaration/definition locations."""
+        return self._send_batch(
+            "textDocument/symbolInfo", queries, lambda q: self._position_params(*q), self._default_timeout
+        )
+
+    def document_ast(self, file_path: Path) -> dict | None:
+        """Read clangd's compiler AST, including active declarations omitted from its outline."""
+        uri = file_path.resolve().as_uri()
+        cached = self._ast_cache.get(uri)
+        if cached is not None:
+            self.check_alive()
+            self._ast_cache.move_to_end(uri)
+            return cached[0]
+        result = self._send_request("textDocument/ast", {"textDocument": {"uri": uri}}, self._default_timeout)
+        if not isinstance(result, dict):
+            self.check_alive()
+            return None
+
+        nodes = 0
+        pending = [result]
+        while pending:
+            node = pending.pop()
+            nodes += 1
+            if nodes > LSP_AST_NODE_BUDGET:
+                return result
+            pending.extend(node.get("children", []))
+        self._ast_cache[uri] = (result, nodes)
+        retained = sum(size for _, size in self._ast_cache.values())
+        while retained > LSP_AST_NODE_BUDGET:
+            _, (_, size) = self._ast_cache.popitem(last=False)
+            retained -= size
+        return result
+
+    def outgoing_calls_batch(self, queries: list[tuple[Path, int, int]]) -> list[list[dict]]:
+        """Resolve compiler-selected callees in two batched stages, preserving query order."""
+        prepared = self._send_batch(
+            "textDocument/prepareCallHierarchy", queries, lambda q: self._position_params(*q), self._default_timeout
+        )
+        items = [(index, item) for index, group in enumerate(prepared) for item in group]
+        outgoing = self._send_batch(
+            "callHierarchy/outgoingCalls", items, lambda entry: {"item": entry[1]}, self._default_timeout
+        )
+        calls: list[list[dict]] = [[] for _ in queries]
+        for (index, _), result in zip(items, outgoing):
+            calls[index].extend(result)
+        return calls
+
+    def document_symbol(self, file_path: Path, timeout: int | None = None) -> list[dict]:
+        """Request document symbols for a file."""
+        result = self._send_request(
+            "textDocument/documentSymbol",
+            {"textDocument": {"uri": file_path.resolve().as_uri()}},
+            timeout=self._default_timeout if timeout is None else timeout,
+        )
+        if isinstance(result, list):
+            return result
+        return []
+
+    def send_definition_batch(
+        self, queries: list[tuple[Path, int, int]], timeout: int | None = None
+    ) -> list[list[dict]]:
+        """Send multiple definition requests without waiting between them."""
+        return self._send_batch(
+            "textDocument/definition",
+            queries,
+            lambda q: self._position_params(*q),
+            self._default_timeout if timeout is None else timeout,
+        )
+
+    def send_type_definition_batch(
+        self, queries: list[tuple[Path, int, int]], timeout: int | None = None
+    ) -> list[list[dict]]:
+        """Resolve each position to the *type* of the expression there.
+
+        Distinct from ``definition``, which lands on the declaration: iterating
+        a value is a call on its type, and only this request names that type.
+        """
+        return self._send_batch(
+            "textDocument/typeDefinition",
+            queries,
+            lambda q: self._position_params(*q),
+            self._default_timeout if timeout is None else timeout,
+        )
+
+    def implementation(self, file_path: Path, line: int, character: int, timeout: int | None = None) -> list[dict]:
+        """Find implementations of the symbol at the given position."""
+        result = self._send_request(
+            "textDocument/implementation",
+            {
+                "textDocument": {"uri": file_path.resolve().as_uri()},
+                "position": {"line": line, "character": character},
+            },
+            timeout=self._default_timeout if timeout is None else timeout,
+        )
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return [result]
+        return []
+
+    def advertises(self, provider: str) -> bool:
+        """Whether the server's ``initialize`` answer offers *provider*, e.g. ``implementationProvider``."""
+        return bool(self._server_capabilities.get(provider))
+
+    def send_implementation_batch(
+        self, queries: list[tuple[Path, int, int]], timeout: int | None = None
+    ) -> list[list[dict]]:
+        """Send multiple implementation requests without waiting between them; none to a server not offering them."""
+        if not self.advertises("implementationProvider"):
+            return [[] for _ in queries]
+        return self._send_batch(
+            "textDocument/implementation",
+            queries,
+            lambda q: self._position_params(*q),
+            self._default_timeout if timeout is None else timeout,
+        )
+
+    def workspace_symbol(self, query: str) -> list[dict]:
+        """Symbols declared anywhere in the loaded workspace whose name matches *query*."""
+        result = self._send_request("workspace/symbol", {"query": query}, self._default_timeout)
+        if isinstance(result, list):
+            return result
+        return []
+
+    def type_hierarchy_prepare(self, file_path: Path, line: int, character: int) -> list[dict] | None:
+        """Prepare type hierarchy at the given position."""
+        if not self.advertises("typeHierarchyProvider"):
+            raise MethodNotFoundError("Server does not offer typeHierarchyProvider")
+        result = self._send_request(
+            "textDocument/prepareTypeHierarchy",
+            {
+                "textDocument": {"uri": file_path.resolve().as_uri()},
+                "position": {"line": line, "character": character},
+            },
+            self._default_timeout,
+        )
+        if isinstance(result, list):
+            return result
+        return None
+
+    def type_hierarchy_supertypes(self, item: dict) -> list[dict]:
+        """Get supertypes for a type hierarchy item."""
+        result = self._send_request("typeHierarchy/supertypes", {"item": item}, self._default_timeout)
+        if isinstance(result, list):
+            return result
+        return []
+
+    def type_hierarchy_subtypes(self, item: dict) -> list[dict]:
+        """Get subtypes for a type hierarchy item."""
+        result = self._send_request("typeHierarchy/subtypes", {"item": item}, self._default_timeout)
+        if isinstance(result, list):
+            return result
+        return []
+
+    # ---- Diagnostics collection ----
+
+    def get_collected_diagnostics(self) -> FileDiagnosticsMap:
+        """Return diagnostics collected during analysis."""
+        with self._diagnostics_lock:
+            return {path: list(items) for path, items in self._diagnostics.items()}
+
+    def get_diagnostics_generation(self) -> int:
+        """Return a counter bumped on each ``publishDiagnostics`` notification."""
+        with self._diagnostics_lock:
+            return self._diagnostics_generation
+
+    def wait_for_diagnostics_quiesce(self, idle_seconds: float, max_wait: float) -> None:
+        """Block until ``publishDiagnostics`` stops arriving for ``idle_seconds`` (or ``max_wait`` elapses).
+
+        Why: csharp-ls (and similar batching servers) emit diagnostics
+        asynchronously after didOpen/load, often *after* the analysis pipeline
+        has already snapshotted them. Other LSPs (pyright, gopls) publish
+        eagerly and don't need this. Adapters opt in via
+        ``diagnostics_quiesce_seconds``.
+        """
+        if idle_seconds <= 0 or max_wait <= 0:
+            return
+        deadline = time.monotonic() + max_wait
+        last_gen = self.get_diagnostics_generation()
+        last_change = time.monotonic()
+        poll_interval = 0.1
+        while time.monotonic() < deadline:
+            time.sleep(poll_interval)
+            gen = self.get_diagnostics_generation()
+            now = time.monotonic()
+            if gen != last_gen:
+                last_gen = gen
+                last_change = now
+                continue
+            if now - last_change >= idle_seconds:
+                return
+
+    def wait_for_progress_quiet(self, title_part: str, quiet_seconds: float, max_wait: float) -> bool:
+        """Block until no work-done progress whose title holds ``title_part`` has been open for
+        ``quiet_seconds``, or ``max_wait`` elapses. True when it went quiet.
+
+        Why: an IntelliJ-based server answers requests during an indexing pass, but from an
+        incomplete index.
+        """
+        deadline = time.monotonic() + max_wait
+        quiet_since = time.monotonic()
+        while time.monotonic() < deadline:
+            busy = any(title_part in title.lower() for title in list(self._work_done_progress_titles.values()))
+            now = time.monotonic()
+            if busy:
+                quiet_since = now
+            elif now - quiet_since >= quiet_seconds:
+                return True
+            time.sleep(0.2)
+        return False
+
+    # ---- JDTLS server-ready wait ----
+
+    def wait_for_server_ready(self, timeout: int = 300) -> bool:
+        """Wait for the LSP server to signal readiness (e.g., JDTLS project import).
+
+        Blocks until a language/status notification with type 'ServiceReady' or
+        'ProjectStatus' with message 'OK' is received, or until timeout.
+
+        Args:
+            timeout: Maximum time to wait in seconds (default: 5 minutes)
+
+        Returns:
+            ``True`` if the server signalled readiness, ``False`` on timeout
+            or if initialization had already failed.
+        """
+        if self._init_failed:
+            logger.warning(
+                "Skipping ready-wait: LSP initialize errored. Subsequent requests will return empty results."
+            )
+            return False
+        logger.info("Waiting for LSP server to be ready...")
+        if self._server_ready.wait(timeout=timeout):
+            logger.info("Server ready")
+            return True
+        logger.warning("Server ready timeout after %ds. Proceeding with analysis anyway.", timeout)
+        return False
+
+    def reset_ready_signal(self) -> None:
+        """Clear the server-ready flag so the next ``wait_for_server_ready``
+        blocks until the LSP server emits its readiness notification again.
+
+        Used by adapters whose LSP transitions out of the ready state during
+        post-didOpen processing (e.g. rust-analyzer flips ``quiescent`` back
+        to ``False`` while ``cargo check`` runs, then back to ``True`` once
+        diagnostics are flushed).
+        """
+        self._server_ready.clear()
+
+    @property
+    def server_health(self) -> str | None:
+        return self._server_health
+
+    @property
+    def server_health_message(self) -> str | None:
+        return self._server_health_message
+
+    # ---- Internal protocol implementation ----
+
+    def _position_params(self, file_path: Path, line: int, character: int) -> dict:
+        """Build standard position-based LSP params (used by definition/implementation)."""
+        return {
+            "textDocument": {"uri": file_path.resolve().as_uri()},
+            "position": {"line": line, "character": character},
+        }
+
+    def _send_batch[T](
+        self, method: str, queries: list[T], build_params: Callable[[T], dict], timeout: int
+    ) -> list[list[dict]]:
+        """Send LSP requests ``REQUEST_BATCH_SIZE`` at a time and collect their results in query order.
+
+        A retryable failure is asked once more; anything still unserved raises rather than
+        reading as "nothing is declared here".
+        """
+        if self.server_failure:
+            self.check_alive()
+        results: list[list[dict]] = []
+        for start in range(0, len(queries), REQUEST_BATCH_SIZE):
+            chunk = queries[start : start + REQUEST_BATCH_SIZE]
+            by_query = self._send_round(method, chunk, build_params, timeout)
+            retry = [index for index, answer in enumerate(by_query) if answer.retryable]
+            if retry:
+                logger.info("Re-asking %d of %d %s requests the server had not settled", len(retry), len(chunk), method)
+                for index, answer in zip(
+                    retry, self._send_round(method, [chunk[i] for i in retry], build_params, timeout)
+                ):
+                    by_query[index] = answer
+
+            unserved = [index for index, answer in enumerate(by_query) if not answer.served]
+            if unserved:
+                first = chunk[unserved[0]]
+                raise StaticAnalysisFatalError(
+                    f"{len(unserved)} of {len(chunk)} {method} requests went unserved, first query: "
+                    f"{first!r}. The server timed out or failed the request "
+                    "rather than declining it; reading those as empty would silently drop call-graph edges."
+                )
+            results.extend(answer.results for answer in by_query)
+        return results
+
+    def _send_round[T](
+        self, method: str, queries: list[T], build_params: Callable[[T], dict], timeout: int
+    ) -> list[BatchAnswer]:
+        """Send one request per query and collect the answers in query order."""
+        req_ids: list[int] = []
+        for query in queries:
+            self._request_id += 1
+            req_id = self._request_id
+            req_ids.append(req_id)
+            message: dict = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": method,
+                "params": build_params(query),
+            }
+            self._write_message(message)
+
+        results, unserved, retryable = self._collect_batch_responses(method, req_ids, timeout=timeout)
+        answers: list[BatchAnswer] = []
+        for req_id in req_ids:
+            raw = results.get(req_id, [])
+            if isinstance(raw, dict):
+                parsed = [raw]
+            elif isinstance(raw, list):
+                parsed = raw
+            else:
+                parsed = []
+            answers.append(BatchAnswer(parsed, req_id not in unserved, req_id in retryable))
+        return answers
+
+    def _send_request(
+        self, method: str, params: dict | list | None, timeout: int, required: bool = False
+    ) -> dict | list | None:
+        """Send a JSON-RPC request and wait for the response; a *required* one that does not succeed is fatal."""
+        if self.server_failure:
+            self.check_alive()
+        self._request_id += 1
+        req_id = self._request_id
+
+        message: dict = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": method,
+            "params": params,
+        }
+        self._write_message(message)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = self._next_response(deadline)
+            if msg is None:
+                continue
+            if msg.get("id") != req_id:
+                continue
+
+            if "error" in msg:
+                error = msg["error"]
+                if required:
+                    raise WorkspaceSetupError(f"The language server rejected {method} {params}: {error}")
+                if isinstance(error, dict) and error.get("code") == LSP_METHOD_NOT_FOUND:
+                    raise MethodNotFoundError(error.get("message", "Method not found"))
+                logger.warning("LSP error for request %d (%s): %s", req_id, method, error)
+                if method == "initialize":
+                    # Initialize errored — the server is not in a usable state.
+                    # Mark so wait_for_server_ready() bails out fast instead of
+                    # blocking for the full 300s readiness timeout.
+                    self._init_failed = True
+                return None
+            return msg.get("result")
+
+        if required:
+            raise WorkspaceSetupError(f"The language server did not answer {method} {params} within {timeout}s")
+        raise TimeoutError(f"Timeout waiting for LSP response to request {req_id}")
+
+    def _send_notification(self, method: str, params: dict | list | None) -> None:
+        """Send a JSON-RPC notification (no response expected)."""
+        message: dict = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }
+        self._write_message(message)
+
+    def _write_message(self, message: dict) -> None:
+        """Write a JSON-RPC message with Content-Length header.
+
+        Thread-safe — the reader thread may write responses to server-
+        initiated requests concurrently with the main thread.
+        """
+        if not self._process or not self._process.stdin:
+            # Fatal: a caller reading a dead server as "no results" drops real edges.
+            raise StaticAnalysisFatalError("LSP server not running")
+        body = json.dumps(message)
+        header = f"Content-Length: {len(body)}\r\n\r\n"
+        data = (header + body).encode("utf-8")
+        with self._write_lock:
+            self._process.stdin.write(data)
+            self._process.stdin.flush()
+
+    def _next_response(self, deadline: float) -> dict | None:
+        """Dequeue the next response message, handling protocol housekeeping.
+
+        Returns None on timeout/empty. Handles server-initiated requests
+        and skips stray notifications automatically.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+
+        now = time.monotonic()
+        if self._process and now - self._last_memory_sample >= LSP_MEMORY_SAMPLE_INTERVAL_SECONDS:
+            self._last_memory_sample = now
+            rss = process_tree_rss(self._process.pid)
+            self._peak_rss = max(self._peak_rss, rss)
+            logger.debug(
+                "LSP process pid=%s: RSS=%s, sampled peak=%s, open documents=%d",
+                self._process.pid,
+                format_bytes(rss),
+                format_bytes(self._peak_rss),
+                len(self._opened_uris),
+            )
+        try:
+            message = self._msg_queue.get(timeout=min(remaining, 1.0))
+        except queue.Empty:
+            if self._process and self._process.poll() is not None:
+                self._raise_process_exited()
+            return None
+
+        # Skip notifications that leaked past the reader loop
+        if "id" not in message:
+            return None
+
+        return message
+
+    def _read_stderr(self) -> None:
+        """Drain server stderr while retaining a bounded failure transcript."""
+        assert self._process is not None and self._process.stderr is not None
+        stream = self._process.stderr
+        for raw in iter(lambda: stream.readline(8192), b""):
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            self._stderr_tail.append(line)
+            logger.debug("LSP stderr: %s", line)
+
+    def _raise_process_exited(self) -> None:
+        """Include exit status and server evidence rather than guessing the cause."""
+        if self._stderr_thread:
+            self._stderr_thread.join(timeout=2)
+        code = self._process.poll() if self._process else None
+        detail = f"code {code}" if code is None or code >= 0 else f"signal {-code} (code {code})"
+        raise StaticAnalysisFatalError(
+            f"LSP server process exited with {detail}; sampled peak RSS={format_bytes(self._peak_rss)}, "
+            f"open documents={len(self._opened_uris)}. Recent stderr:\n" + "\n".join(self._stderr_tail)
+        )
+
+    def _collect_batch_responses(
+        self, method: str, request_ids: list[int], timeout: int
+    ) -> tuple[dict[int, list[dict]], set[int], set[int]]:
+        """Collect responses for multiple pending request IDs.
+
+        Returns ``(results, unserved_ids, retryable_ids)``. An error with a server-defined code is an
+        answer whose empty result is the truth; a timeout or a reserved code leaves the request unserved.
+        """
+        results: dict[int, list[dict]] = {}
+        pending = set(request_ids)
+        declined: dict[str, int] = {}
+        unserved: dict[int, str] = {}
+        retryable: set[int] = set()
+        deadline = time.monotonic() + timeout
+
+        while pending and time.monotonic() < deadline:
+            msg = self._next_response(deadline)
+            if msg is None:
+                continue
+
+            msg_id = msg.get("id")
+            if msg_id not in pending:
+                continue
+
+            pending.discard(msg_id)  # type: ignore[arg-type]
+
+            if "error" in msg:
+                err = msg["error"]
+                results[msg_id] = []  # type: ignore[index]
+                err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                if (
+                    isinstance(err, dict)
+                    and err.get("code") == LSP_METHOD_NOT_FOUND
+                    and method in {"textDocument/prepareCallHierarchy", "callHierarchy/outgoingCalls"}
+                ):
+                    raise MethodNotFoundError(f"{method}: {err_msg}")
+                if isinstance(err, dict) and err.get("code") == LSP_METHOD_NOT_FOUND and method in LSP_REQUIRED_METHODS:
+                    raise StaticAnalysisFatalError(
+                        f"The language server does not implement {method}: {err_msg}. "
+                        "Reading that as an empty answer would build a graph of symbols with no edges."
+                    )
+                verdict = ErrorVerdict.FAILURE
+                if self._error_verdict is not None and isinstance(err, dict) and _is_protocol_failure(err):
+                    verdict = self._error_verdict(err)
+                if _is_protocol_failure(err) and verdict is not ErrorVerdict.DECLINED:
+                    unserved[msg_id] = err_msg  # type: ignore[index]
+                    if _is_retryable(err) or verdict is ErrorVerdict.TRANSIENT:
+                        retryable.add(msg_id)  # type: ignore[arg-type]
+                else:
+                    declined[err_msg] = declined.get(err_msg, 0) + 1
+            else:
+                results[msg_id] = msg.get("result") or []  # type: ignore[index]
+
+        for err_msg, count in declined.items():
+            if count > 1:
+                logger.debug("LSP declined %s (x%d): %s", method, count, err_msg)
+            else:
+                logger.debug("LSP declined %s: %s", method, err_msg)
+
+        for req_id, err_msg in unserved.items():
+            if req_id not in retryable:
+                logger.warning("LSP could not serve %s request %d: %s", method, req_id, err_msg)
+        for req_id in pending:
+            logger.warning("Timeout waiting for %s request %d", method, req_id)
+            results[req_id] = []
+
+        return results, set(pending) | set(unserved), retryable
+
+    # ---- Background message reader ----
+
+    def _reader_loop(self) -> None:
+        """Background thread: continuously read messages and enqueue them.
+
+        Notifications and server-initiated requests are handled inline
+        and NOT enqueued — only responses go on the queue.  Server
+        requests (e.g. client/registerCapability) must be answered
+        immediately because some servers (csharp-ls) block on the
+        response before continuing workspace initialization.
+        """
+        while not self._shutdown_event.is_set():
+            if not self._process or self._stdout_fd is None:
+                break
+            if self._process.poll() is not None:
+                break
+            try:
+                msg = self._read_single_message()
+                if msg is None:
+                    break
+
+                method = msg.get("method", "")
+                if "id" not in msg and method:
+                    # Pure notification — handle and discard, don't enqueue
+                    self._handle_notification(method, msg.get("params", {}))
+                    continue
+
+                # Server-initiated request — respond immediately so the
+                # server isn't blocked waiting for our reply.
+                if "id" in msg and method:
+                    result = self._handle_server_request(msg)
+                    self._write_message({"jsonrpc": "2.0", "id": msg["id"], "result": result})
+                    continue
+
+                self._msg_queue.put(msg)
+            except Exception as e:
+                if not self._shutdown_event.is_set():
+                    logger.debug("Reader loop error: %s", e)
+                break
+
+    def _handle_server_request(self, message: dict) -> object:
+        """Respond to server-initiated requests.
+
+        LSP servers may send requests like ``workspace/configuration`` to
+        fetch client-side settings.  gopls, for example, sends one
+        ``workspace/configuration`` request per workspace folder with
+        ``items: [{"section": "gopls"}]`` and expects an array of flat
+        settings objects back.
+        """
+        method = message.get("method", "")
+        if method == "workspace/configuration" and self._workspace_settings:
+            items = message.get("params", {}).get("items", [])
+            # Return one settings object per requested item.
+            return [self._workspace_settings for _ in items] if items else [self._workspace_settings]
+        return None
+
+    def _handle_notification(self, method: str, params: dict) -> None:
+        """Process LSP notifications for diagnostics and server status."""
+        if method == "textDocument/publishDiagnostics":
+            uri = params.get("uri", "")
+            diagnostics = params.get("diagnostics", [])
+            if uri:
+                file_path = uri_to_path(uri)
+                if file_path:
+                    file_key = str(file_path.resolve())
+                    lsp_diags = [LSPDiagnostic.from_lsp_dict(d) for d in diagnostics]
+                    with self._diagnostics_lock:
+                        self._diagnostics[file_key] = lsp_diags
+                        self._diagnostics_generation += 1
+
+        elif method == "language/status":
+            status_type = params.get("type", "")
+            status_message = params.get("message", "")
+            logger.debug("LSP status: type=%s, message=%s", status_type, status_message)
+
+            if status_type == "ServiceReady":
+                self._server_ready.set()
+                logger.info("LSP server: ServiceReady")
+            elif status_type == "ProjectStatus" and status_message == "OK":
+                self._server_ready.set()
+                logger.info("LSP server: ProjectStatus OK")
+
+        elif method == "experimental/serverStatus":
+            # rust-analyzer's readiness signal. ``quiescent`` flips True once
+            # the initial workspace load completes; we set ready then
+            # regardless of health (a ``warning`` state still has a usable
+            # reference index, just with diagnostics flagged).
+            quiescent = bool(params.get("quiescent", False))
+            health = params.get("health", "")
+            message = params.get("message", "")
+            self._server_health = health
+            self._server_health_message = message
+            logger.debug("rust-analyzer status: health=%s, quiescent=%s", health, quiescent)
+            if quiescent:
+                self._server_ready.set()
+                logger.info("LSP server: rust-analyzer quiescent (health=%s)", health)
+
+        elif method == "indexingStarted":
+            # Intelephense emits a pair of custom notifications around its
+            # workspace index. References are incomplete until indexingEnded.
+            self._server_ready.clear()
+
+        elif method == "indexingEnded":
+            self._server_ready.set()
+            logger.info("LSP server: workspace indexing ended")
+
+        elif method == "window/logMessage":
+            message_text = params.get("message", "")
+            if "initial workspace load failed" in message_text.lower():
+                self._server_ready.clear()
+                self._work_done_progress_failures.update(self._work_done_progress_titles)
+            # Why: typescript-language-server outlives a crashed tsserver and answers every later request empty.
+            if "[tsserver] Exited." in message_text:
+                self.server_failure = message_text
+            # csharp-ls signals workspace readiness via logMessage
+            if "Finished loading solution" in message_text:
+                self._server_ready.set()
+                logger.info("LSP server: solution loaded (%s)", message_text)
+
+        elif method == "intellij/importLog":
+            # A build the server cannot import is reported here; the import itself still ends FINISHED.
+            if params.get("failed"):
+                self.import_failed = True
+                logger.warning("LSP server: build import failed: %s", str(params.get("message", ""))[:300])
+
+        elif method == "intellij/workspaceImportState":
+            self.import_phase = str(params.get("phase", ""))
+            self.import_folder_statuses = [
+                str(folder.get("status", "")) for folder in params.get("folders") or [] if isinstance(folder, dict)
+            ]
+            logger.info("LSP server: workspace import %s %s", self.import_phase, self.import_folder_statuses)
+            if self.import_phase in ("FINISHED", "FAILED"):
+                self.import_finished.set()
+                self._server_ready.set()
+
+        elif method == "$/progress":
+            # csharp-ls and gopls report workspace load through work-done
+            # progress. Remember the begin title because end notifications
+            # do not have to repeat it.
+            token = _progress_token(params.get("token"))
+            value = params.get("value", {}) or {}
+            kind = value.get("kind")
+            message_text = value.get("message", "") or ""
+            if kind == "begin" and token is not None:
+                title = value.get("title", "") or ""
+                self._work_done_progress_titles[token] = title
+                self._work_done_progress_failures.discard(token)
+                # A server that reports its build import is ready once that import ends; its later
+                # indexing passes (kotlin-lsp runs them continually) are waited for separately.
+                if "indexing" in title.lower() and not self.import_finished.is_set():
+                    self._server_ready.clear()
+            elif kind == "report" and token is not None and _progress_indicates_failure(message_text):
+                self._work_done_progress_failures.add(token)
+            elif kind == "end":
+                title = self._work_done_progress_titles.pop(token, "") if token is not None else ""
+                failed = (
+                    token in self._work_done_progress_failures if token is not None else False
+                ) or _progress_indicates_failure(message_text)
+                if token is not None:
+                    self._work_done_progress_failures.discard(token)
+                if "project file(s) loaded" in message_text and not failed:
+                    self._server_ready.set()
+                    logger.info("LSP server: workspace loaded (%s)", " ".join(filter(None, [title, message_text])))
+                elif title == "Setting up workspace" and not failed:
+                    self._server_ready.set()
+                    logger.info("LSP server: workspace loaded (%s)", " ".join(filter(None, [title, message_text])))
+                elif "indexing" in title.lower() and not failed:
+                    self._server_ready.set()
+                    # Passes after an import are kotlin-lsp's continual re-indexing, every few seconds.
+                    logger.log(
+                        (logging.DEBUG if self.import_finished.is_set() else logging.INFO),
+                        "LSP server: workspace indexing ended (%s)",
+                        " ".join(filter(None, [title, message_text])),
+                    )
+
+    def _read_single_message(self) -> dict | None:
+        """Read a single JSON-RPC message from stdout using raw fd I/O."""
+        fd = self._stdout_fd
+        if fd is None:
+            return None
+
+        content_length = None
+        header_buf = bytearray()
+
+        # Read header byte-by-byte to avoid reading past message boundaries
+        while True:
+            try:
+                byte = os.read(fd, 1)
+            except OSError:
+                return None
+            if not byte:
+                return None
+            header_buf.append(byte[0])
+
+            if len(header_buf) >= 4 and header_buf[-4:] == b"\r\n\r\n":
+                break
+
+        header_str = header_buf.decode("utf-8", errors="replace")
+        for line in header_str.strip().split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                content_length = int(line.split(":", 1)[1].strip())
+
+        if content_length is None:
+            return None
+
+        body = bytearray()
+        while len(body) < content_length:
+            try:
+                chunk = os.read(fd, content_length - len(body))
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            body.extend(chunk)
+
+        return json.loads(body.decode("utf-8", errors="replace"))

@@ -1,0 +1,264 @@
+from pathlib import Path
+import xml.etree.ElementTree as ET
+import logging
+
+from infra.repo_utils.ignore import RepoIgnoreManager
+
+logger = logging.getLogger(__name__)
+
+
+class JavaProjectConfig:
+
+    def __init__(
+        self,
+        root: Path,
+        build_system: str,  # "maven", "gradle", "eclipse", or "none"
+        is_multi_module: bool = False,
+        modules: list[Path] | None = None,
+    ):
+        self.root = root
+        self.build_system = build_system
+        self.is_multi_module = is_multi_module
+        self.modules = modules or []
+
+    def __repr__(self):
+        return (
+            f"JavaProjectConfig(root={self.root}, "
+            f"build_system={self.build_system}, "
+            f"is_multi_module={self.is_multi_module}, "
+            f"modules={len(self.modules)})"
+        )
+
+
+class JavaConfigScanner:
+
+    def __init__(self, repo_path: Path, ignore_manager: RepoIgnoreManager | None = None):
+        self.repo_path = repo_path
+        self.ignore_manager = ignore_manager if ignore_manager else RepoIgnoreManager(repo_path)
+
+    def scan(self) -> list[JavaProjectConfig]:
+        """
+        Scan repository for Java projects.
+
+        Returns list of JavaProjectConfig objects, one per root project.
+        For multi-module projects, returns single config with submodules.
+        """
+        projects = []
+
+        # Find all potential project roots
+        maven_roots = self._find_maven_projects()
+        gradle_roots = self._find_gradle_projects()
+        eclipse_roots = self._find_eclipse_projects()
+
+        # Process Maven projects
+        for root in maven_roots:
+            if not self.ignore_manager.should_ignore(root):
+                config = self._analyze_maven_project(root)
+                if config:
+                    projects.append(config)
+
+        # Process Gradle projects
+        for root in gradle_roots:
+            if not self.ignore_manager.should_ignore(root):
+                # Check if a Maven project already exists at the same root
+                same_root_maven = [p for p in projects if p.root == root and p.build_system == "maven"]
+                if same_root_maven and self._has_gradle_wrapper(root):
+                    # Gradle wrapper exists: prefer Gradle over Maven at same root
+                    config = self._analyze_gradle_project(root)
+                    if config:
+                        projects = [p for p in projects if p not in same_root_maven]
+                        projects.append(config)
+                        logger.info(f"Replaced Maven with Gradle project at {root} (Gradle wrapper found)")
+                elif not any(self._is_subpath(root, p.root) for p in projects):
+                    config = self._analyze_gradle_project(root)
+                    if config:
+                        projects.append(config)
+                        # Remove Maven sub-projects that are within this Gradle root.
+                        # JDTLS handles module discovery natively for Gradle projects.
+                        before_count = len(projects)
+                        projects = [
+                            p
+                            for p in projects
+                            if not (p.build_system == "maven" and p.root != root and self._is_subpath(p.root, root))
+                        ]
+                        removed = before_count - len(projects)
+                        if removed > 0:
+                            logger.info(f"Removed {removed} Maven sub-project(s) covered by Gradle root at {root}")
+
+        # After Gradle: a root Gradle replaced no longer vouches for the modules its pom lists.
+        projects = self._without_reactor_modules(projects)
+
+        # Process Eclipse projects (only if no Maven/Gradle)
+        for root in eclipse_roots:
+            if not self.ignore_manager.should_ignore(root):
+                if not any(self._is_subpath(root, p.root) for p in projects):
+                    config = JavaProjectConfig(root, "eclipse", False)
+                    projects.append(config)
+
+        # If no build system found but Java files exist, create basic config
+        if not projects and self._has_java_files(self.repo_path):
+            logger.warning(
+                f"No Maven/Gradle/Eclipse project found in {self.repo_path}, "
+                f"but Java files detected. Analysis will be limited."
+            )
+            projects.append(JavaProjectConfig(self.repo_path, "none", False))
+
+        return projects
+
+    def _without_reactor_modules(self, projects: list[JavaProjectConfig]) -> list[JavaProjectConfig]:
+        """Remove Maven projects a kept root's reactor already imports.
+
+        Why: JDTLS imports the whole reactor from the root pom, so a module's own engine repeats that
+        work, and without the reactor it cannot resolve its sibling modules. Only ``<modules>`` entries
+        at the top level of a pom count, and only inside the root: a commented-out module, a module
+        listed in a profile alone, a path outside the root or a pom file all keep their engine, because
+        the root's engine may not reach them.
+        """
+        maven = {project.root.resolve(): project for project in projects if project.build_system == "maven"}
+        covered: set[Path] = set()
+        # Outermost first: a project still uncovered when its turn comes has no root above it.
+        for root in sorted(maven, key=lambda path: len(path.parts)):
+            if root in covered:
+                continue
+            reached = {root}
+            pending = [root]
+            while pending:
+                for module in maven[pending.pop()].modules:
+                    resolved = module.resolve()
+                    if resolved in maven and resolved not in reached and resolved.is_relative_to(root):
+                        reached.add(resolved)
+                        pending.append(resolved)
+            reached.remove(root)
+            if reached:
+                logger.info(f"Removed {len(reached)} Maven module(s) covered by the reactor at {root}")
+                covered |= reached
+        return [project for project in projects if project.root.resolve() not in covered]
+
+    def _find_maven_projects(self) -> list[Path]:
+        """Find all directories containing pom.xml."""
+        return [p.parent for p in self.repo_path.rglob("pom.xml") if p.is_file()]
+
+    def _find_gradle_projects(self) -> list[Path]:
+        """Find all directories containing settings.gradle.
+
+        Excludes buildSrc directories, which are Gradle's convention for
+        build logic and should not be treated as separate projects.
+        """
+        gradle_roots: list[Path] = []
+
+        # settings.gradle indicates a project root
+        gradle_roots.extend(p.parent for p in self.repo_path.rglob("settings.gradle") if p.is_file())
+        gradle_roots.extend(p.parent for p in self.repo_path.rglob("settings.gradle.kts") if p.is_file())
+
+        # Filter out buildSrc directories (Gradle build logic, not a real project)
+        gradle_roots = [r for r in gradle_roots if r.name != "buildSrc"]
+
+        return gradle_roots
+
+    def _find_eclipse_projects(self) -> list[Path]:
+        """Find all directories containing .project file."""
+        return [
+            p.parent for p in self.repo_path.rglob(".project") if p.is_file() and (p.parent / ".classpath").exists()
+        ]
+
+    def _analyze_maven_project(self, pom_dir: Path) -> JavaProjectConfig | None:
+        """Analyze a Maven project to determine if it's multi-module."""
+        pom_file = pom_dir / "pom.xml"
+
+        try:
+            tree = ET.parse(pom_file)
+            root = tree.getroot()
+
+            # Define namespace
+            ns = {"maven": "http://maven.apache.org/POM/4.0.0"}
+
+            # Check for <modules> section
+            modules_elem = root.find("maven:modules", ns)
+            if modules_elem is None:
+                # Also try without namespace (some POMs don't use it)
+                modules_elem = root.find("modules")
+
+            if modules_elem is not None and len(modules_elem) > 0:
+                # Multi-module project
+                module_paths = []
+                for module in modules_elem.findall("maven:module", ns) or modules_elem.findall("module"):
+                    if module.text is not None:
+                        module_name = module.text.strip()
+                        module_path = pom_dir / module_name
+                        if module_path.exists():
+                            module_paths.append(module_path)
+
+                return JavaProjectConfig(pom_dir, "maven", is_multi_module=True, modules=module_paths)
+            else:
+                # Single-module Maven project
+                return JavaProjectConfig(pom_dir, "maven", False)
+
+        except ET.ParseError as e:
+            logger.warning(f"Failed to parse {pom_file}: {e}")
+            return None
+
+    def _analyze_gradle_project(self, gradle_dir: Path) -> JavaProjectConfig | None:
+        """
+        Analyze a Gradle project to determine if it's multi-project.
+
+        Note: We only detect if it's multi-module, but don't parse the actual modules.
+        JDTLS will discover all modules during project import via its native Gradle integration,
+        which handles complex cases like dynamic includes, Kotlin DSL, and multi-line statements.
+        """
+        settings_file = gradle_dir / "settings.gradle"
+        if not settings_file.exists():
+            settings_file = gradle_dir / "settings.gradle.kts"
+
+        if not settings_file.exists():
+            return JavaProjectConfig(gradle_dir, "gradle", False)
+
+        try:
+            content = settings_file.read_text(encoding="utf-8", errors="replace")
+
+            # Simple check: does settings.gradle contain any include statement?
+            # This is just a heuristic - JDTLS will do the actual module discovery
+            has_includes = "include" in content and ("'" in content or '"' in content)
+
+            if has_includes:
+                # Multi-project Gradle build - let JDTLS discover the actual modules
+                return JavaProjectConfig(gradle_dir, "gradle", is_multi_module=True, modules=[])
+            else:
+                return JavaProjectConfig(gradle_dir, "gradle", False)
+
+        except Exception as e:
+            logger.warning(f"Failed to parse {settings_file}: {e}")
+            return JavaProjectConfig(gradle_dir, "gradle", False)
+
+    def _has_gradle_wrapper(self, directory: Path) -> bool:
+        """Check if a Gradle wrapper exists in the directory."""
+        return (directory / "gradlew").exists() or (directory / "gradlew.bat").exists()
+
+    def _has_java_files(self, directory: Path) -> bool:
+        """Check if directory contains any .java files."""
+        try:
+            next(directory.rglob("*.java"))
+            return True
+        except StopIteration:
+            return False
+
+    def _is_subpath(self, path: Path, parent: Path) -> bool:
+        """Check if path is a subpath of parent."""
+        try:
+            path.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+
+def scan_java_projects(repo_path: Path) -> list[JavaProjectConfig]:
+    """
+    Convenience function to scan for Java projects.
+
+    Args:
+        repo_path: Root directory of repository
+
+    Returns:
+        List of JavaProjectConfig objects
+    """
+    scanner = JavaConfigScanner(repo_path)
+    return scanner.scan()

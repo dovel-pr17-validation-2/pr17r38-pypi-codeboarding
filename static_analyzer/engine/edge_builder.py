@@ -1,0 +1,696 @@
+"""Call-graph edges, built from definitions.
+
+Tree-sitter finds every call site in a file and the language server answers
+``textDocument/definition`` at each; the implementation step then finishes the
+polymorphic calls a base declaration stands in for.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from itertools import chain
+from pathlib import Path
+
+from static_analyzer.engine.edge_build_context import EdgeBuildContext
+from static_analyzer.engine.progress import ProgressLogger
+from static_analyzer.config import NodeType
+from static_analyzer.engine.lsp_constants import (
+    CALLABLE_KINDS,
+    CLASS_LIKE_KINDS,
+    DISPATCHED_KINDS,
+    REQUEST_BATCH_SIZE,
+    RUNTIME_REFERENCE_KINDS,
+)
+from static_analyzer.engine.models import CallSite, ExternalCallSite, SymbolInfo
+from static_analyzer.engine.protocols import EdgeBuildAdapter
+from static_analyzer.engine.source_inspector import SourceInspector
+from static_analyzer.engine.symbol_table import SymbolTable
+from static_analyzer.engine.utils import definition_location
+from static_analyzer.graph_definitions import (
+    CALL,
+    IMPLEMENTATION,
+    ITERATED,
+    MEMBER_READ,
+    MEMBER_WRITE,
+    METHOD_GROUP,
+    OVERRIDE,
+    RECEIVER,
+    RUNTIME_REFERENCE,
+    potential_calls,
+    resolve_declaration,
+)
+from static_analyzer.internal_references import is_self_or_container_edge, parent_qualified_name, simple_name
+
+logger = logging.getLogger(__name__)
+
+EdgeMap = dict[tuple[str, str], list[CallSite]]
+
+
+@dataclass(frozen=True)
+class ImplementationQuery:
+    caller_qname: str
+    target_qname: str
+    target_file: Path
+    target_line: int
+    target_char: int
+    call_site: CallSite
+
+
+@dataclass(frozen=True)
+class DefinitionResolution:
+    edge_set: EdgeMap
+    impl_queries_pending: list[ImplementationQuery]
+    total_sites: int
+    total_resolved: int
+
+
+# Modifiers that mean a derived member does NOT take part in dispatch through
+# the base: ``new`` hides, ``static`` and ``private`` cannot be reached at all.
+_NON_DISPATCHING_MODIFIERS = frozenset({"new", "static", "private"})
+
+
+@dataclass(frozen=True)
+class DispatchIndex:
+    """What source says about inheritance, for servers that answer no hierarchy query."""
+
+    subclasses: dict[str, list[SymbolInfo]]
+    modifiers: dict[tuple[str, str], frozenset[str]]
+    ambiguous: set[str]
+
+    def dispatches_to(self, owner: SymbolInfo, subclass_name: str, member: str) -> bool:
+        """Whether a call on *owner* can actually land on *subclass_name*'s *member*."""
+        if owner.kind == NodeType.INTERFACE:
+            # Implicit implementations carry no modifier at all, so the only
+            # thing to exclude is a member that is not an implementation.
+            return not (self.modifiers.get((subclass_name, member), frozenset()) & _NON_DISPATCHING_MODIFIERS)
+        found = self.modifiers.get((subclass_name, member))
+        if found is None:
+            return True
+        return "override" in found or "explicit" in found
+
+
+class CallEdgeSink:
+    """Every edge one resolved call site contributes, so each route to a target adds the same set.
+
+    The target itself, the overrides a base-typed call dispatches to, the ``Add`` a collection
+    initializer runs, the class a method belongs to, and the implementation query that finishes
+    a polymorphic call.
+    """
+
+    def __init__(
+        self, adapter: EdgeBuildAdapter, st: SymbolTable, inspector: SourceInspector, dispatch: DispatchIndex | None
+    ) -> None:
+        self.edges: EdgeMap = {}
+        self.impl_queries: list[ImplementationQuery] = []
+        self._adapter = adapter
+        self._st = st
+        self._inspector = inspector
+        self._dispatch = dispatch
+
+    def add(
+        self,
+        caller: SymbolInfo,
+        target: SymbolInfo,
+        call_site: CallSite,
+        collection: bool = False,
+        reference_only: bool = False,
+    ) -> None:
+        """Record the call from *caller* to *target*, unless the pair is not an edge at all."""
+        if not _is_valid_edge(self._adapter, caller, target):
+            return
+        # Guards keep the innermost caller; only the credit line rolls up.
+        attributed = self._st.attribution_symbol(caller)
+        if not _is_valid_edge(self._adapter, attributed, target):
+            return
+
+        _add_edge_call_site(self.edges, attributed.qualified_name, target.qualified_name, call_site)
+
+        # A constructor, or a member named on the base, runs exactly the declaration resolved.
+        dispatched = (
+            not reference_only and target.kind in DISPATCHED_KINDS and not self._inspector.names_base_member(call_site)
+        )
+        extra = _override_targets(target, self._st, self._dispatch) if dispatched else []
+        if collection:
+            extra.extend(_members_named(target, self._st, "Add"))
+        if (self._adapter.is_callable(target.kind) or target.kind == NodeType.ENUM_MEMBER) and target.parent_chain:
+            _, parent_kind = target.parent_chain[-1]
+            if self._adapter.is_class_like(parent_kind):
+                parent = self._st.symbols.get(
+                    target.owner_qualified_name
+                    if target.explicit_identity
+                    else parent_qualified_name(target.qualified_name)
+                )
+                if parent is not None:
+                    extra.append(parent)
+        for other in extra:
+            if _is_valid_edge(self._adapter, caller, other) and _is_valid_edge(self._adapter, attributed, other):
+                _add_edge_call_site(self.edges, attributed.qualified_name, other.qualified_name, call_site)
+
+        if dispatched:
+            self.impl_queries.append(
+                ImplementationQuery(
+                    caller_qname=attributed.qualified_name,
+                    target_qname=target.qualified_name,
+                    target_file=target.file_path,
+                    target_line=target.start_line,
+                    target_char=target.start_char,
+                    call_site=call_site,
+                )
+            )
+
+
+class SymbolIndex:
+    """The symbol table by position and by name, for resolving definition results."""
+
+    def __init__(self, st: SymbolTable, inspector: SourceInspector) -> None:
+        self._inspector = inspector
+        self._by_position: dict[tuple[str, int, int], SymbolInfo] = {}
+        self._by_name: dict[tuple[str, str], dict[tuple[str, int, int], SymbolInfo]] = {}
+        self.callable_names: set[str] = set()
+        """The names the table declares callables under."""
+        redeclarations = (sym for symbols in st.file_symbols.values() for sym in symbols if sym.explicit_identity)
+        for sym in chain(st.symbols.values(), redeclarations):
+            position = sym.definition_location
+            name = simple_name(sym.name if sym.explicit_identity else sym.qualified_name)
+            self._keep_most_specific(self._by_position, position, sym)
+            if sym.kind in CALLABLE_KINDS or sym.kind in CLASS_LIKE_KINDS:
+                at = self._by_name.setdefault((str(sym.file_path), name), {})
+                self._keep_most_specific(at, position, sym)
+            if sym.kind in CALLABLE_KINDS:
+                self.callable_names.add(name)
+        self._files = {file for file, _, _ in self._by_position}
+
+    def resolve(self, def_result: dict) -> SymbolInfo | None:
+        """The symbol a definition result names, by ``resolve_declaration``."""
+        location = definition_location(def_result)
+        if location is None or str(location[0]) not in self._files:
+            return None
+        file_path, line, char = location
+        file_key = str(file_path)
+        return resolve_declaration(
+            self._inspector,
+            file_path,
+            line,
+            char,
+            lambda at_line, at_char: self._by_position.get((file_key, at_line, at_char)),
+            lambda name: list(self._by_name.get((file_key, name), {}).values()),
+        )
+
+    @staticmethod
+    def _keep_most_specific(
+        holder: dict[tuple[str, int, int], SymbolInfo], position: tuple[str, int, int], sym: SymbolInfo
+    ) -> None:
+        """Dual registrations share a position; the longest qualified name is the specific one."""
+        held = holder.get(position)
+        if held is None or len(sym.qualified_name) > len(held.qualified_name):
+            holder[position] = sym
+
+
+def build_edges_via_definitions(
+    adapter: EdgeBuildAdapter,
+    ctx: EdgeBuildContext,
+    source_files: list[Path],
+) -> EdgeMap:
+    """Scan source for call sites, resolve each by definition, then expand polymorphic ones."""
+    index = SymbolIndex(ctx.symbol_table, ctx.source_inspector)
+
+    resolution = _resolve_definitions(adapter, ctx, source_files, index)
+    if adapter.expands_virtual_dispatch:
+        # Why: the dispatch index reads inheritance from these files alone, so an override
+        # declared in a file another engine, or an earlier run, read is the merged graph's to add.
+        ctx.external_call_sites.extend(
+            ExternalCallSite(
+                caller=query.caller_qname,
+                file=str(query.target_file),
+                line=query.target_line,
+                character=query.target_char,
+                call_site=query.call_site,
+                kind=OVERRIDE,
+                member=query.target_qname,
+            )
+            for query in resolution.impl_queries_pending
+        )
+
+    total_impl_resolved = _resolve_implementations(
+        adapter, ctx, resolution.edge_set, resolution.impl_queries_pending, index
+    )
+
+    total_iterated = 0
+    if adapter.resolves_iterated_types:
+        total_iterated = _resolve_iterated_types(adapter, ctx, resolution.edge_set, source_files, index)
+
+    logger.info(
+        "Phase 2 summary: %d call sites, %d def resolved, %d impl resolved, %d iterated, %d raw edges",
+        resolution.total_sites,
+        resolution.total_resolved,
+        total_impl_resolved,
+        total_iterated,
+        len(resolution.edge_set),
+    )
+    return resolution.edge_set
+
+
+def _resolve_iterated_types(
+    adapter: EdgeBuildAdapter,
+    ctx: EdgeBuildContext,
+    edge_set: EdgeMap,
+    source_files: list[Path],
+    index: SymbolIndex,
+) -> int:
+    """Edge from a loop to the type it enumerates.
+
+    ``foreach (var x in bag)`` calls ``GetEnumerator`` on whatever ``bag`` is,
+    but the syntax names only the value. A type query is the one request that
+    names the type, so this is the only route to the edge.
+    """
+    st = ctx.symbol_table
+    resolved = 0
+
+    for file_path in source_files:
+        sites = ctx.source_inspector.find_iterated_expression_sites(file_path)
+        if not sites:
+            continue
+        results = ctx.lsp.send_type_definition_batch([(file_path, site.lsp_line, site.lsp_column) for site in sites])
+        for site, definitions in zip(sites, results):
+            caller = _caller_at(ctx, file_path, site.lsp_line, site.lsp_column)
+            if caller is None:
+                continue
+            attributed = st.attribution_symbol(caller)
+            for result in definitions:
+                target = index.resolve(result)
+                if target is None:
+                    _record_external_call_site(ctx, attributed.qualified_name, result, site, ITERATED)
+                    continue
+                if not _is_valid_edge(adapter, caller, target):
+                    continue
+                resolved += 1
+                if not _is_valid_edge(adapter, attributed, target):
+                    continue
+                _add_edge_call_site(edge_set, attributed.qualified_name, target.qualified_name, site)
+                # The loop calls the enumerator, so name it too when the
+                # type declares one rather than inheriting it.
+                for enumerator in _members_named(target, st, "GetEnumerator"):
+                    if _is_valid_edge(adapter, caller, enumerator) and _is_valid_edge(adapter, attributed, enumerator):
+                        _add_edge_call_site(edge_set, attributed.qualified_name, enumerator.qualified_name, site)
+    return resolved
+
+
+def _resolve_definitions(
+    adapter: EdgeBuildAdapter,
+    ctx: EdgeBuildContext,
+    source_files: list[Path],
+    index: SymbolIndex,
+) -> DefinitionResolution:
+    """Phase 2a: Resolve call sites via textDocument/definition."""
+    st = ctx.symbol_table
+    si = ctx.source_inspector
+    total_files = len(source_files)
+    total_sites = 0
+    total_resolved = 0
+
+    dispatch = _build_dispatch_index(adapter, ctx, source_files) if adapter.expands_virtual_dispatch else None
+    sink = CallEdgeSink(adapter, st, si, dispatch)
+
+    # What a call answered with a class runs, by that class.
+    constructors: dict[str, list[SymbolInfo]] = {}
+    if adapter.constructor_calls_resolve_to_class:
+        for sym in st.symbols.values():
+            constructed = adapter.constructed_class(sym)
+            if constructed:
+                constructors.setdefault(constructed, []).append(sym)
+
+    pbar = ProgressLogger("Phase 2 (definitions)", total_files, unit="file")
+    for file_path in source_files:
+        potential = potential_calls(file_path, si, adapter, index.callable_names)
+        call_sites = potential.call_sites
+        if not call_sites:
+            pbar.update(1)
+            continue
+
+        total_sites += len(call_sites)
+        unresolved: list[CallSite] = []
+
+        results = ctx.lsp.send_definition_batch([(file_path, site.lsp_line, site.lsp_column) for site in call_sites])
+        for call_site, defs in zip(call_sites, results):
+            position = (call_site.lsp_line, call_site.lsp_column)
+            kind = potential.definition_kind_at(position)
+
+            if not defs:
+                if kind == CALL:
+                    unresolved.append(call_site)
+                continue
+
+            caller = _caller_at(ctx, file_path, call_site.lsp_line, call_site.lsp_column)
+            if caller is None:
+                continue
+
+            resolved_here = False
+            for def_result in defs:
+                target = index.resolve(def_result)
+                if target is not None and kind == CALL and adapter.constructor_calls_resolve_to_class:
+                    target = _constructor_called(adapter, target, constructors, si, call_site) or target
+                if target is None:
+                    _record_external_call_site(
+                        ctx, st.attribution_symbol(caller).qualified_name, def_result, call_site, kind
+                    )
+                    continue
+                total_resolved += 1
+                resolved_here = True
+
+                if kind == RUNTIME_REFERENCE and target.kind not in RUNTIME_REFERENCE_KINDS:
+                    continue
+                if kind == METHOD_GROUP and not (
+                    adapter.is_callable(target.kind)
+                    or adapter.is_class_like(target.kind)
+                    or si.declares_function_value(target.file_path, target.start_line, target.start_char)
+                ):
+                    continue
+                if kind in (MEMBER_READ, MEMBER_WRITE) and not adapter.is_callable(target.kind):
+                    continue
+                location = definition_location(def_result)
+                if kind == MEMBER_WRITE and (location is None or not si.declares_setter(*location)):
+                    continue
+
+                sink.add(
+                    caller,
+                    target,
+                    call_site,
+                    collection=position in potential.collection,
+                    reference_only=kind == RUNTIME_REFERENCE,
+                )
+
+            if not resolved_here and kind == CALL:
+                unresolved.append(call_site)
+
+        total_resolved += _resolve_through_receivers(ctx, index, sink, file_path, unresolved)
+
+        pbar.set_postfix(edges=len(sink.edges), resolved=total_resolved)
+        pbar.update(1)
+    pbar.finish()
+
+    return DefinitionResolution(
+        edge_set=sink.edges,
+        impl_queries_pending=sink.impl_queries,
+        total_sites=total_sites,
+        total_resolved=total_resolved,
+    )
+
+
+def _resolve_through_receivers(
+    ctx: EdgeBuildContext,
+    index: SymbolIndex,
+    sink: CallEdgeSink,
+    file_path: Path,
+    unresolved: list[CallSite],
+) -> int:
+    """Edges for ``receiver.member(...)`` whose member left the repository but whose receiver did not.
+
+    Why: a repository object typed as something external -- mermaid's ``log`` typed as
+    ``console`` -- sends every definition query on the member into a type declaration, while
+    the receiver still names the object that holds the member being run.
+    """
+    if not unresolved:
+        return 0
+    st = ctx.symbol_table
+    by_receiver = ctx.source_inspector.receivers_of(file_path, unresolved)
+    if not by_receiver:
+        return 0
+
+    positions = list(by_receiver)
+    results = ctx.lsp.send_definition_batch([(file_path, line, column) for line, column in positions])
+    resolved = 0
+    for position, definitions in zip(positions, results):
+        call_site, member = by_receiver[position]
+        caller = _caller_at(ctx, file_path, call_site.lsp_line, call_site.lsp_column)
+        if caller is None:
+            continue
+        for def_result in definitions:
+            receiver = index.resolve(def_result)
+            if receiver is None:
+                _record_external_call_site(
+                    ctx, st.attribution_symbol(caller).qualified_name, def_result, call_site, RECEIVER, member
+                )
+                continue
+            target = st.symbols.get(f"{receiver.qualified_name}.{member}")
+            if target is None:
+                continue
+            resolved += 1
+            sink.add(caller, target, call_site)
+    return resolved
+
+
+def _resolve_implementations(
+    adapter: EdgeBuildAdapter,
+    ctx: EdgeBuildContext,
+    edge_set: EdgeMap,
+    impl_queries_pending: list[ImplementationQuery],
+    index: SymbolIndex,
+) -> int:
+    """Phase 2b: Resolve implementations for polymorphic call targets.
+
+    Adds implementation edges to edge_set in-place. Returns total_impl_resolved.
+    """
+    st = ctx.symbol_table
+
+    target_pos_to_callers: dict[tuple[str, int, int], list[tuple[str, CallSite]]] = {}
+    for query in impl_queries_pending:
+        tgt_key = (str(query.target_file), query.target_line, query.target_char)
+        target_pos_to_callers.setdefault(tgt_key, []).append((query.caller_qname, query.call_site))
+
+    targets = list(target_pos_to_callers)
+    logger.info(
+        "Phase 2b (implementations): %d unique targets from %d pending queries", len(targets), len(impl_queries_pending)
+    )
+
+    total_impl_resolved = 0
+    # Why a round at a time here: on a large repository this is the longest phase, and progress is only
+    # reported between rounds.
+    pbar = ProgressLogger("Phase 2b (impl)", len(targets), unit="target")
+    for start in range(0, len(targets), REQUEST_BATCH_SIZE):
+        batch = targets[start : start + REQUEST_BATCH_SIZE]
+        impl_results = ctx.lsp.send_implementation_batch([(Path(file), line, char) for file, line, char in batch])
+        for tgt_key, impls in zip(batch, impl_results):
+            callers = target_pos_to_callers[tgt_key]
+            for impl_result in impls:
+                impl_sym = index.resolve(impl_result)
+                if impl_sym is None:
+                    for caller_qname, call_site in callers:
+                        _record_external_call_site(ctx, caller_qname, impl_result, call_site, IMPLEMENTATION)
+                    continue
+                total_impl_resolved += 1
+
+                for caller_qname, call_site in callers:
+                    caller_sym = st.symbols.get(caller_qname)
+                    if caller_sym and _is_valid_edge(adapter, caller_sym, impl_sym):
+                        _add_edge_call_site(edge_set, caller_qname, impl_sym.qualified_name, call_site)
+
+        pbar.set_postfix(edges=len(edge_set), resolved=total_impl_resolved)
+        pbar.update(len(batch))
+    pbar.finish()
+
+    return total_impl_resolved
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _caller_at(ctx: EdgeBuildContext, file_path: Path, line: int, column: int) -> SymbolInfo | None:
+    """The callable a call written at this position belongs to.
+
+    A decoration runs where it is written but belongs to the member below it, so the lookup
+    is redirected to that member's own position rather than guessed from the gap.
+    """
+    line, column = ctx.source_inspector.attribution_position(file_path, line, column)
+    caller = ctx.symbol_table.find_containing_symbol(file_path, line, column)
+    return ctx.symbol_table.lift_to_callable(caller) if caller else None
+
+
+def _record_external_call_site(
+    ctx: EdgeBuildContext, caller: str, answer: dict, call_site: CallSite, kind: str, member: str = ""
+) -> None:
+    """Keep an answer that landed in a file this engine never named, for the merged graph."""
+    location = definition_location(answer)
+    if location is None or str(location[0]) in ctx.symbol_table.file_symbols:
+        return
+    ctx.external_call_sites.append(
+        ExternalCallSite(
+            caller=caller,
+            file=str(location[0]),
+            line=location[1],
+            character=location[2],
+            call_site=call_site,
+            kind=kind,
+            member=member,
+        )
+    )
+
+
+def _add_edge_call_site(edge_set: EdgeMap, source: str, destination: str, call_site: CallSite) -> None:
+    sites = edge_set.setdefault((source, destination), [])
+    if call_site not in sites:
+        sites.append(call_site)
+
+
+def _build_dispatch_index(
+    adapter: EdgeBuildAdapter,
+    ctx: EdgeBuildContext,
+    source_files: list[Path],
+) -> DispatchIndex:
+    """Inheritance and member modifiers, read from source, for virtual-dispatch expansion."""
+    st = ctx.symbol_table
+    classes_by_file: dict[str, dict[str, SymbolInfo]] = {}
+    declaring_files: dict[str, set[tuple[str, int]]] = {}
+    for sym in st.symbols.values():
+        if not adapter.is_class_like(sym.kind):
+            continue
+        classes_by_file.setdefault(str(sym.file_path), {}).setdefault(sym.name, sym)
+        declaring_files.setdefault(sym.name, set()).add((str(sym.file_path), sym.start_line))
+
+    # A base is only ever its simple name in source, so a name two namespaces
+    # both declare cannot be told apart — and expanding it would wire every
+    # subclass of one to calls on the other.
+    ambiguous = {name for name, sites in declaring_files.items() if len(sites) > 1}
+
+    subclasses: dict[str, list[SymbolInfo]] = {}
+    modifiers: dict[tuple[str, str], frozenset[str]] = {}
+    # Why the known declarations' files too: on a warm start a subclass declared in an unchanged file
+    # still overrides what a changed file calls.
+    read = set(source_files)
+    known_files = sorted({sym.file_path for sym in st.known if adapter.is_class_like(sym.kind)} - read)
+    for file_path in [*source_files, *known_files]:
+        declared = classes_by_file.get(str(file_path))
+        if not declared:
+            continue
+        modifiers.update(ctx.source_inspector.find_member_modifiers(file_path))
+        for type_name, bases in ctx.source_inspector.find_type_bases(file_path):
+            sub = declared.get(type_name)
+            if sub is None:
+                continue
+            for base in bases:
+                if base not in ambiguous:
+                    subclasses.setdefault(base, []).append(sub)
+    if ambiguous:
+        logger.info("Skipped %d ambiguous base type name(s) for virtual dispatch", len(ambiguous))
+    return DispatchIndex(subclasses=subclasses, modifiers=modifiers, ambiguous=ambiguous)
+
+
+def _members_named(target: SymbolInfo, st: SymbolTable, name: str) -> list[SymbolInfo]:
+    """Overloads of *name* declared on *target*."""
+    found: list[SymbolInfo] = []
+    for owner in _member_owner_prefixes(target):
+        prefix = f"{owner}.{name}"
+        for qualified_name, symbol in st.symbols.items():
+            if not qualified_name.startswith(prefix):
+                continue
+            # Only that member, not a longer name starting with it.
+            if qualified_name[len(prefix) :].startswith(("(", "<")):
+                found.append(symbol)
+        if found:
+            break
+    return found
+
+
+def _member_owner_prefixes(target: SymbolInfo) -> list[str]:
+    """Qualified-name prefixes a member of *target* may be filed under.
+
+    A class whose name matches its file collapses into the file's segment, so
+    ``InlineValidator<T>`` in ``InlineValidator.cs`` owns ``...InlineValidator.Add``
+    rather than ``...InlineValidator.InlineValidator<T>.Add``.
+    """
+    prefixes = [target.qualified_name]
+    parent = parent_qualified_name(target.qualified_name)
+    simple = target.qualified_name[len(parent) + 1 :].split("<", 1)[0] if parent else ""
+    if parent and simple and parent.split(".")[-1] == simple:
+        prefixes.append(parent)
+    return prefixes
+
+
+def _override_targets(
+    target: SymbolInfo,
+    st: SymbolTable,
+    dispatch: DispatchIndex | None,
+) -> list[SymbolInfo]:
+    """Same-named members on every type deriving from the target's own type.
+
+    A call through a base-typed reference resolves to the base declaration,
+    which for an abstract member has no body; the overrides are what actually run.
+    """
+    if dispatch is None:
+        return []
+    owner_qname = parent_qualified_name(target.qualified_name)
+    owner = st.symbols.get(owner_qname)
+    if owner is None or owner.name in dispatch.ambiguous or not dispatch.subclasses.get(owner.name):
+        return []
+
+    member = target.qualified_name[len(owner_qname) + 1 :]
+    overrides: list[SymbolInfo] = []
+    seen: set[str] = set()
+    stack = list(dispatch.subclasses[owner.name])
+    while stack:
+        sub = stack.pop()
+        if sub.qualified_name in seen:
+            continue
+        seen.add(sub.qualified_name)
+        override = st.symbols.get(f"{sub.qualified_name}.{member}")
+        if override is not None and dispatch.dispatches_to(owner, sub.name, member):
+            overrides.append(override)
+        stack.extend(dispatch.subclasses.get(sub.name, []))
+    return overrides
+
+
+def _constructor_called(
+    adapter: EdgeBuildAdapter,
+    target: SymbolInfo,
+    constructors: dict[str, list[SymbolInfo]],
+    si: SourceInspector,
+    call_site: CallSite,
+) -> SymbolInfo | None:
+    """The constructor a call answered with its class runs: the one whose parameter count matches
+    the arguments, else the first declared (the primary constructor, where default arguments
+    usually sit). None keeps the edge on the class: a call the adapter does not read as a
+    construction, or same-arity overloads that cannot be told apart.
+    """
+    callee = si.identifier_at(Path(call_site.file), call_site.lsp_line, call_site.lsp_column)
+    if callee is None or not adapter.constructs(target, callee):
+        return None
+    candidates = sorted(constructors.get(target.qualified_name, ()), key=lambda sym: sym.definition_location)
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+    arguments = si.call_argument_count(Path(call_site.file), call_site.lsp_line, call_site.lsp_column)
+    matching = [sym for sym in candidates if _parameter_count(sym.qualified_name) == arguments]
+    if len(matching) > 1:
+        return None
+    return matching[0] if matching else candidates[0]
+
+
+def _parameter_count(qualified_name: str) -> int | None:
+    """Parameters in the ``(A, B)`` signature a callable's name ends with, or None without one."""
+    if not qualified_name.endswith(")") or "(" not in qualified_name:
+        return None
+    inside = qualified_name[qualified_name.index("(") + 1 : -1].strip()
+    if not inside:
+        return 0
+    # The ``>`` of a function type's ``->`` closes nothing.
+    inside = inside.replace("->", "")
+    depth, count = 0, 1
+    for char in inside:
+        depth += char in "(<["
+        depth -= char in ")>]"
+        count += char == "," and depth == 0
+    return count
+
+
+def _is_valid_edge(adapter: EdgeBuildAdapter, caller: SymbolInfo, target: SymbolInfo) -> bool:
+    """Check if an edge between caller and target is valid."""
+    if is_self_or_container_edge(caller.qualified_name, target.qualified_name) and not adapter.declared_apart(
+        caller, target
+    ):
+        return False
+    if target.definition_location == caller.definition_location:
+        return False
+    if (str(target.file_path), target.start_line) == (str(caller.file_path), caller.start_line):
+        return False
+    return True

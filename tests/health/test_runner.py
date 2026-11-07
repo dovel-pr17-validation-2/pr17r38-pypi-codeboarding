@@ -1,0 +1,307 @@
+import os
+import unittest
+
+from health.models import HealthCheckConfig, StandardCheckSummary
+from health.runner import run_health_checks
+from static_analyzer.analysis_result import StaticAnalysisResults
+from static_analyzer.config import Language
+from static_analyzer.cfg import CallGraph
+from static_analyzer.node import Node
+
+
+_REPO_ROOT = "/project"
+
+
+def _make_node(fqn: str, file_path: str, line_start: int, line_end: int) -> Node:
+    return Node(
+        fully_qualified_name=fqn,
+        node_type=12,
+        file_path=file_path,
+        line_start=line_start,
+        line_end=line_end,
+    )
+
+
+class TestHealthRunner(unittest.TestCase):
+    def test_full_report_generation(self):
+        """Test that the runner produces a valid HealthReport from StaticAnalysisResults."""
+        # Build a simple call graph
+        graph = CallGraph(language=Language.PYTHON)
+        graph.add_node(_make_node("mod.small_func", "/project/src/mod.py", 0, 10))
+        graph.add_node(_make_node("mod.large_func", "/project/src/mod.py", 10, 120))
+        graph.add_node(_make_node("mod.caller", "/project/src/mod.py", 120, 140))
+        graph.add_node(_make_node("mod.orphan", "/project/src/orphan.py", 0, 5))
+        graph.add_edge("mod.caller", "mod.small_func")
+        graph.add_edge("mod.caller", "mod.large_func")
+
+        # Build StaticAnalysisResults
+        results = StaticAnalysisResults()
+        results.add_cfg(Language.PYTHON, graph)
+        results.add_references(Language.PYTHON, list(graph.nodes.values()))
+        results.add_source_files(Language.PYTHON, ["/project/src/mod.py", "/project/src/orphan.py"])
+
+        hierarchy = {
+            "mod": {
+                "superclasses": [],
+                "subclasses": [],
+                "file_path": "/project/src/mod.py",
+                "line_start": 0,
+                "line_end": 140,
+            }
+        }
+        results.add_class_hierarchy(Language.PYTHON, hierarchy)
+
+        pkg_deps = {
+            "mod": {"imports": ["os", "sys"], "imported_by": []},
+        }
+        results.add_package_dependencies(Language.PYTHON, pkg_deps)
+
+        # Use fixed thresholds for predictable test results
+        config = HealthCheckConfig(
+            function_size_max=100,
+        )
+
+        report = run_health_checks(results, "test-repo", _REPO_ROOT, config=config)
+        assert report is not None
+
+        # Check overall structure
+        self.assertEqual(report.repository_name, "test-repo")
+        self.assertGreaterEqual(report.overall_score, 0.0)
+        self.assertLessEqual(report.overall_score, 1.0)
+
+        # Should have check summaries
+        self.assertGreater(len(report.check_summaries), 0)
+
+        # Find function_size check
+        size_summary = next(s for s in report.check_summaries if s.check_name == "function_size")
+        self.assertIsNotNone(size_summary)
+        assert isinstance(size_summary, StandardCheckSummary)
+        # large_func is 110 lines (>100 threshold)
+        self.assertEqual(size_summary.findings_count, 1)
+
+        # Find unused_code_diagnostics check
+        unused_code_summary = next(s for s in report.check_summaries if s.check_name == "unused_code_diagnostics")
+        self.assertIsNotNone(unused_code_summary)
+        assert isinstance(unused_code_summary, StandardCheckSummary)
+
+        # Check that report can be serialized to JSON
+        import json
+
+        json_str = report.model_dump_json()
+        self.assertIsInstance(json_str, str)
+        data = json.loads(json_str)
+        self.assertEqual(data["repository_name"], "test-repo")
+
+    def test_json_serialization(self):
+        """Test that the HealthReport can be serialized to JSON."""
+        graph = CallGraph(language=Language.PYTHON)
+        graph.add_node(_make_node("mod.func", "/project/src/mod.py", 0, 50))
+
+        results = StaticAnalysisResults()
+        results.add_cfg(Language.PYTHON, graph)
+        results.add_references(Language.PYTHON, list(graph.nodes.values()))
+        results.add_source_files(Language.PYTHON, ["/project/src/mod.py"])
+
+        report = run_health_checks(results, "test", _REPO_ROOT)
+        assert report is not None
+
+        # Serialize to JSON
+        import json
+
+        json_str = report.model_dump_json()
+        data = json.loads(json_str)
+
+        # Verify structure
+        self.assertEqual(data["repository_name"], "test")
+        self.assertIn("overall_score", data)
+        self.assertIn("timestamp", data)
+        self.assertIn("check_summaries", data)
+        self.assertIn("file_summaries", data)
+
+    def test_empty_results(self):
+        """Test that empty StaticAnalysisResults returns None."""
+        results = StaticAnalysisResults()
+        report = run_health_checks(results, "empty-repo", _REPO_ROOT)
+        self.assertIsNone(report)
+
+    def test_custom_config(self):
+        """Test that custom config thresholds are respected."""
+        graph = CallGraph(language=Language.PYTHON)
+        graph.add_node(_make_node("mod.func", "/project/f.py", 0, 40))
+
+        results = StaticAnalysisResults()
+        results.add_cfg(Language.PYTHON, graph)
+        results.add_references(Language.PYTHON, list(graph.nodes.values()))
+        results.add_source_files(Language.PYTHON, ["/project/f.py"])
+
+        # With default fixed threshold (max=500), no finding
+        config_default = HealthCheckConfig(
+            function_size_max=500,
+        )
+        report_default = run_health_checks(results, "test", _REPO_ROOT, config=config_default)
+        assert report_default is not None
+        size_default = next(s for s in report_default.check_summaries if s.check_name == "function_size")
+        assert isinstance(size_default, StandardCheckSummary)
+        self.assertEqual(size_default.findings_count, 0)
+
+        # With lower threshold, should find it
+        config = HealthCheckConfig(
+            function_size_max=30,
+        )
+        report_custom = run_health_checks(results, "test", _REPO_ROOT, config=config)
+        assert report_custom is not None
+        size_custom = next(s for s in report_custom.check_summaries if s.check_name == "function_size")
+        assert isinstance(size_custom, StandardCheckSummary)
+        self.assertEqual(size_custom.findings_count, 1)
+
+    def test_file_summaries_aggregation(self):
+        """Test that file-level summaries aggregate correctly."""
+        graph = CallGraph(language=Language.PYTHON)
+        graph.add_node(_make_node("mod.func1", "/project/src/mod.py", 0, 120))
+        graph.add_node(_make_node("mod.func2", "/project/src/mod.py", 120, 250))
+
+        results = StaticAnalysisResults()
+        results.add_cfg(Language.PYTHON, graph)
+        results.add_references(Language.PYTHON, list(graph.nodes.values()))
+        results.add_source_files(Language.PYTHON, ["/project/src/mod.py"])
+
+        config = HealthCheckConfig(
+            function_size_max=100,
+        )
+        report = run_health_checks(results, "test", _REPO_ROOT, config=config)
+        assert report is not None
+
+        # Should have file summaries
+        file_sums = report.file_summaries
+        self.assertGreater(len(file_sums), 0)
+
+        # The file with violations should have findings
+        mod_file = next((f for f in file_sums if "mod.py" in f.file_path), None)
+        self.assertIsNotNone(mod_file)
+        assert mod_file is not None
+        self.assertGreater(mod_file.total_findings, 0)
+
+    def test_report_paths_are_relative_to_repo_root(self):
+        if os.name == "nt":
+            project_root = "C:\\home\\user\\project"
+            src_mod = "C:\\home\\user\\project\\src\\mod.py"
+            lib_utils = "C:\\home\\user\\project\\lib\\utils.py"
+        else:
+            project_root = "/home/user/project"
+            src_mod = "/home/user/project/src/mod.py"
+            lib_utils = "/home/user/project/lib/utils.py"
+
+        graph = CallGraph(language=Language.PYTHON)
+        graph.add_node(_make_node("mod.func1", src_mod, 0, 120))
+        graph.add_node(_make_node("mod.func2", src_mod, 120, 250))
+        graph.add_node(_make_node("utils.helper", lib_utils, 0, 10))
+
+        results = StaticAnalysisResults()
+        results.add_cfg(Language.PYTHON, graph)
+        results.add_references(Language.PYTHON, list(graph.nodes.values()))
+        results.add_source_files(
+            Language.PYTHON,
+            [src_mod, lib_utils],
+        )
+
+        config = HealthCheckConfig(
+            function_size_max=100,
+        )
+        report = run_health_checks(results, "test", project_root, config=config)
+        assert report is not None
+
+        # All file paths in findings should be relative
+        for summary in report.check_summaries:
+            if hasattr(summary, "finding_groups"):
+                for group in summary.finding_groups:  # type: ignore[attr-defined]
+                    for entity in group.entities:
+                        if entity.file_path is not None:
+                            self.assertFalse(
+                                entity.file_path.startswith(project_root),
+                                f"Expected relative path, got: {entity.file_path}",
+                            )
+
+    def test_healthignore_excludes_by_entity_name(self):
+        """Test that .healthignore patterns exclude findings by entity name."""
+        graph = CallGraph(language=Language.PYTHON)
+        graph.add_node(_make_node("evals.utils.gen", "/project/src/evals/utils.py", 0, 200))
+        graph.add_node(_make_node("mod.func", "/project/src/mod.py", 0, 200))
+
+        results = StaticAnalysisResults()
+        results.add_cfg(Language.PYTHON, graph)
+        results.add_references(Language.PYTHON, list(graph.nodes.values()))
+        results.add_source_files(Language.PYTHON, ["/project/src/evals/utils.py", "/project/src/mod.py"])
+
+        config = HealthCheckConfig(
+            function_size_max=100,
+            health_exclude_patterns=["evals.*"],
+        )
+        report = run_health_checks(results, "test", _REPO_ROOT, config=config)
+        assert report is not None
+
+        size_summary = next(s for s in report.check_summaries if s.check_name == "function_size")
+        assert isinstance(size_summary, StandardCheckSummary)
+        entity_names = {e.entity_name for g in size_summary.finding_groups for e in g.entities}
+        self.assertNotIn("evals.utils.gen", entity_names)
+        self.assertIn("mod.func", entity_names)
+
+    def test_healthignore_excludes_by_file_path(self):
+        """Test that .healthignore patterns exclude findings by file path."""
+        graph = CallGraph(language=Language.PYTHON)
+        graph.add_node(_make_node("evals.gen", "/project/src/evals/gen.py", 0, 200))
+        graph.add_node(_make_node("mod.func", "/project/src/mod.py", 0, 200))
+
+        results = StaticAnalysisResults()
+        results.add_cfg(Language.PYTHON, graph)
+        results.add_references(Language.PYTHON, list(graph.nodes.values()))
+        results.add_source_files(Language.PYTHON, ["/project/src/evals/gen.py", "/project/src/mod.py"])
+
+        config = HealthCheckConfig(
+            function_size_max=100,
+            health_exclude_patterns=["*/evals/*"],
+        )
+        report = run_health_checks(results, "test", _REPO_ROOT, config=config)
+        assert report is not None
+
+        size_summary = next(s for s in report.check_summaries if s.check_name == "function_size")
+        assert isinstance(size_summary, StandardCheckSummary)
+        entity_names = {e.entity_name for g in size_summary.finding_groups for e in g.entities}
+        self.assertNotIn("evals.gen", entity_names)
+        self.assertIn("mod.func", entity_names)
+
+    def test_healthignore_excludes_diagnostics_by_file(self):
+        """Test that .healthignore patterns exclude LSP diagnostics by file path."""
+        from static_analyzer.lsp_client.diagnostics import LSPDiagnostic
+
+        graph = CallGraph(language=Language.PYTHON)
+        graph.add_node(_make_node("mod.func", "/project/src/mod.py", 0, 10))
+
+        results = StaticAnalysisResults()
+        results.add_cfg(Language.PYTHON, graph)
+        results.add_references(Language.PYTHON, list(graph.nodes.values()))
+        results.add_source_files(Language.PYTHON, ["/project/src/mod.py", "/project/src/evals/utils.py"])
+
+        # Add diagnostics for both files
+        results.diagnostics = {
+            Language.PYTHON: {
+                "/project/src/mod.py": [
+                    LSPDiagnostic(code="reportUnusedImport", message="'os' is not accessed", severity=2, tags=[1]),
+                ],
+                "/project/src/evals/utils.py": [
+                    LSPDiagnostic(code="reportUnusedImport", message="'sys' is not accessed", severity=2, tags=[1]),
+                ],
+            }
+        }
+
+        config = HealthCheckConfig(health_exclude_patterns=["*/evals/*"])
+        report = run_health_checks(results, "test", _REPO_ROOT, config=config)
+        assert report is not None
+
+        diag_summary = next(s for s in report.check_summaries if s.check_name == "unused_code_diagnostics")
+        assert isinstance(diag_summary, StandardCheckSummary)
+        # Only the mod.py diagnostic should remain
+        self.assertEqual(diag_summary.findings_count, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
